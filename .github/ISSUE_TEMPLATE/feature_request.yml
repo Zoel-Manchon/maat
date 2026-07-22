@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a focused improvement for the editor
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Explain the workflow or limitation behind the request.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the keys, commands or UI involved.
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Area
+      options:
+        - Editing
+        - Navigation
+        - Integrity and file I/O
+        - User interface
+        - Performance
+        - Documentation
+    validations:
+      required: true

@@ -1,0 +1,21 @@
+[package]
+name = "maat"
+version = "0.3.0"
+edition = "2021"
+authors = ["Zoel Arias Manchón"]
+description = "A retro modal terminal editor in Rust with Vim-inspired motions and SHA-256 integrity checks"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/Zoel-Manchon/maat"
+keywords = ["terminal", "editor", "vim", "ratatui", "sha256"]
+categories = ["command-line-utilities", "text-editors"]
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

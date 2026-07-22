@@ -1,0 +1,34 @@
+name: Bug report
+description: Report a reproducible problem in Maat
+title: "bug: "
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the actual and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Run `maat file.txt`
+        2. Press ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and terminal
+      placeholder: Windows 11 / Windows Terminal, Ubuntu / Kitty, etc.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Maat version
+      placeholder: 0.2.0

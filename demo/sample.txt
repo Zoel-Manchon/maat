@@ -1,0 +1,15 @@
+Maat keeps the editing loop quiet and explicit.
+
+The buffer carries its own SHA-256 fingerprint.
+Before a save, Maat weighs it against the file on disk.
+An external modification becomes a visible conflict, not silent data loss.
+
+As above, so below: memory and disk must agree.
+
+Try these actions:
+- /integrity        search and highlight
+- yy then p         copy and paste a line
+- u and Ctrl-r      undo and redo
+- :check            verify disk state
+- :hash             show the full fingerprint
+- ?                 open the quick reference
