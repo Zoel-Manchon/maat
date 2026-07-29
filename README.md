@@ -4,11 +4,6 @@
 
 **A retro modal terminal editor with integrity awareness.**
 
-[![CI](https://github.com/Zoel-Manchon/maat/actions/workflows/ci.yml/badge.svg)](https://github.com/Zoel-Manchon/maat/actions/workflows/ci.yml)
-![Rust](https://img.shields.io/badge/Rust-2021-b03a48?logo=rust&logoColor=f5ede6)
-![License](https://img.shields.io/badge/license-MIT-e0a458)
-![Status](https://img.shields.io/badge/status-prototype-c48b94)
-
 *As above, so below — the buffer and the disk must agree.*
 
 ![Maat animated interface preview](assets/maat-demo.gif)
