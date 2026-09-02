@@ -2,9 +2,33 @@
 
 All notable changes to Maat are documented here.
 
-## [Unreleased]
+## [0.4.0] - 2026-09-02
 
 ### Changed
+
+- **Layout rebuilt for the 80x25 console** Maat actually ships on inside
+  Emberwall. The welcome screen was centred against a hardcoded line count that
+  no longer matched its contents, leaving it five rows above the optical centre;
+  it is now measured from the real content.
+- **The welcome hints are a two-column block.** They used to be centred line by
+  line, so the key column started at columns 33, 26, 28 and 30 — visibly ragged.
+  Keys are now right-aligned against a shared gutter, descriptions left-aligned
+  after it.
+- **The key guide is sized to its contents.** A fixed 74x22 box left nine empty
+  rows at the foot on an 80x25 console. It now measures its own columns, and
+  truncates rather than wraps when narrow, so the two columns survive.
+- **The status bar measures instead of guessing.** Width breakpoints of 96 and
+  66 columns withheld the full metrics on an 80-column console that had room for
+  them. It now picks the richest block that fits and truncates the file name —
+  the only elastic field — instead of overflowing.
+- **The gutter breathes:** `  1 │ text` rather than `  1│text`, with the tilde
+  filler right-aligned in the number column.
+
+### Added
+
+- Rendering regression tests over `ratatui`'s `TestBackend` covering vertical
+  centring, column alignment, overlay sizing and status-bar overflow at widths
+  from 40 to 120 columns.
 
 - Rebuilt the GitHub demo to cover the complete feature set and make the
   external-tamper scenario explicit.

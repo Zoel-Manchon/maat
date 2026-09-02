@@ -8,20 +8,23 @@
 //!   │ :command, /search, msg   │  ← message line
 //!   └──────────────────────────┘
 
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::core::mode::Mode;
 use crate::ui::app::{App, Level};
 use crate::ui::theme;
 
-/// Gutter width for a buffer of `lines` lines.
+/// Columns the gutter spends on decoration: a space either side of the rule.
+const GUTTER_TRIM: u16 = 3;
+
+/// Gutter width for a buffer of `lines` lines: `" 12 │ "`.
 fn gutter_width(lines: usize) -> u16 {
     let digits = lines.to_string().len().max(3);
-    digits as u16 + 1
+    digits as u16 + GUTTER_TRIM
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -67,7 +70,14 @@ fn draw_buffer(frame: &mut Frame, area: Rect, app: &App, gutter: u16) {
         let row = app.offset_row + screen_row;
 
         if row >= total {
-            lines.push(Line::from(Span::styled("~", theme::tilde())));
+            // Past the last line: the tilde sits in the number column, and the
+            // rule stops, so where the buffer ends stays unambiguous.
+            let filler = format!(
+                "{:>width$}",
+                "~",
+                width = (gutter as usize).saturating_sub(GUTTER_TRIM as usize)
+            );
+            lines.push(Line::from(Span::styled(filler, theme::tilde())));
             continue;
         }
 
@@ -77,9 +87,9 @@ fn draw_buffer(frame: &mut Frame, area: Rect, app: &App, gutter: u16) {
             row + 1
         };
         let number = format!(
-            "{:>width$}│",
+            "{:>width$} │ ",
             shown_number,
-            width = (gutter as usize).saturating_sub(1)
+            width = (gutter as usize).saturating_sub(GUTTER_TRIM as usize)
         );
         let is_current = row == app.cursor.row;
         let number_style = if is_current {
@@ -136,41 +146,102 @@ fn highlight_matches(text: String, query: &str, base: Style) -> Vec<Span<'static
     spans
 }
 
+/// Key/description pairs offered on the empty-buffer screen.
+const WELCOME_HINTS: [(&str, &str); 4] = [
+    ("i", "start typing"),
+    (":w <path>", "save the document"),
+    ("/text", "search the buffer"),
+    ("?", "open the key guide"),
+];
+
+const WELCOME_TITLE: &str = "M  A  A  T";
+const WELCOME_SUBTITLE: &str = "modal editor · integrity aware";
+const WELCOME_FOOTER: &str = "AS ABOVE, SO BELOW · SHA-256 WATCH";
+/// Blank columns between the key column and the description column.
+const WELCOME_GAP: usize = 3;
+
 fn draw_welcome(frame: &mut Frame, area: Rect) {
-    let height = area.height as usize;
-    let top_padding = height.saturating_sub(14) / 2;
-    let mut lines = vec![Line::from(""); top_padding];
+    let width = |text: &str| text.chars().count();
 
-    lines.extend([
-        Line::from(Span::styled("M  A  A  T", theme::welcome_title())),
-        Line::from(Span::styled("modal editor · integrity aware", theme::welcome_dim())),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("i", theme::welcome_accent()),
-            Span::styled("  start typing", theme::text()),
-        ]),
-        Line::from(vec![
-            Span::styled(":w <path>", theme::welcome_accent()),
-            Span::styled("  save the document", theme::text()),
-        ]),
-        Line::from(vec![
-            Span::styled("/text", theme::welcome_accent()),
-            Span::styled("  search the buffer", theme::text()),
-        ]),
-        Line::from(vec![
-            Span::styled("?", theme::welcome_accent()),
-            Span::styled("  open the key guide", theme::text()),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled("AS ABOVE, SO BELOW · SHA-256 WATCH", theme::welcome_dim())),
-    ]);
+    // The hints are a two-column block: keys right-aligned against the gap,
+    // descriptions left-aligned after it. Centring each line independently —
+    // which is what `Alignment::Center` does — leaves the key column ragged.
+    let key_column = WELCOME_HINTS.iter().map(|(key, _)| width(key)).max().unwrap_or(0);
+    let description_column = WELCOME_HINTS
+        .iter()
+        .map(|(_, description)| width(description))
+        .max()
+        .unwrap_or(0);
+    let hints_width = key_column + WELCOME_GAP + description_column;
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .alignment(Alignment::Center)
-            .style(theme::text()),
-        area,
+    // Every element is centred against one block, so the whole screen shares a
+    // single optical axis instead of three competing ones.
+    let block_width = hints_width
+        .max(width(WELCOME_TITLE))
+        .max(width(WELCOME_SUBTITLE))
+        .max(width(WELCOME_FOOTER))
+        .min(area.width as usize);
+    let left_margin = (area.width as usize).saturating_sub(block_width) / 2;
+    let pad = " ".repeat(left_margin);
+
+    // Centres `text` inside the block, then shifts it out to the block's margin.
+    let centred = |text: &str, style| {
+        let inner = block_width.saturating_sub(width(text)) / 2;
+        Line::from(Span::styled(
+            format!("{pad}{}{text}", " ".repeat(inner)),
+            style,
+        ))
+    };
+
+    let hints_indent = pad.clone() + &" ".repeat(block_width.saturating_sub(hints_width) / 2);
+    let hint = |key: &str, description: &str| {
+        Line::from(vec![
+            Span::styled(
+                format!("{hints_indent}{key:>key_column$}"),
+                theme::welcome_accent(),
+            ),
+            Span::styled(
+                format!("{}{description}", " ".repeat(WELCOME_GAP)),
+                theme::text(),
+            ),
+        ])
+    };
+
+    let mut body = vec![
+        centred(WELCOME_TITLE, theme::welcome_title()),
+        centred(WELCOME_SUBTITLE, theme::welcome_dim()),
+        Line::from(""),
+    ];
+    body.extend(
+        WELCOME_HINTS
+            .iter()
+            .map(|(key, description)| hint(key, description)),
     );
+    body.push(Line::from(""));
+    body.push(centred(WELCOME_FOOTER, theme::welcome_dim()));
+
+    // Centred against the real line count; a hardcoded guess drifts the moment
+    // a hint is added or removed.
+    let top_padding = (area.height as usize).saturating_sub(body.len()) / 2;
+    let mut lines = vec![Line::from(""); top_padding];
+    lines.extend(body);
+
+    frame.render_widget(Paragraph::new(lines).style(theme::text()), area);
+}
+
+/// Columns the status bar always keeps for the file name before it starts
+/// dropping metrics.
+const NAME_MIN_WIDTH: usize = 12;
+
+/// Shortens `text` to `limit` columns, marking the cut with an ellipsis.
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    match limit.checked_sub(1) {
+        Some(room) => text.chars().take(room).chain(['…']).collect(),
+        None => String::new(),
+    }
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -188,23 +259,35 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let position = format!(" {}:{} ", app.cursor.row + 1, app.cursor.col + 1);
     let (lines, words, chars) = app.stats();
 
-    let left = vec![
+    let mut left = vec![
         Span::styled(" MAAT ", theme::logo()),
         Span::styled(tag, tag_style),
         Span::styled(format!(" {name}"), theme::status()),
         Span::styled(modified, theme::modified()),
     ];
 
-    let metrics = if area.width >= 96 {
-        format!(" {lines}L {words}W {chars}C · sha256 {hash}…")
-    } else if area.width >= 66 {
-        format!(" {lines}L {words}W · {hash}…")
-    } else {
-        String::new()
-    };
-    let right_text = format!("{metrics}{position}");
+    // Width breakpoints guess; measuring does not. Take the richest metrics
+    // block that still leaves the file name readable.
+    let fixed: usize = left.iter().map(|span| span.content.chars().count()).sum::<usize>()
+        - name.chars().count()
+        + position.chars().count();
+    let metrics = [
+        format!(" {lines}L {words}W {chars}C · sha256 {hash}…"),
+        format!(" {lines}L {words}W · {hash}…"),
+        format!(" {lines}L {words}W"),
+        String::new(),
+    ]
+    .into_iter()
+    .find(|candidate| fixed + candidate.chars().count() + NAME_MIN_WIDTH <= area.width as usize)
+    .unwrap_or_default();
+
+    // The name is the only elastic field, so it is the one that yields.
+    let name_budget = (area.width as usize).saturating_sub(fixed + metrics.chars().count());
+    left[2] = Span::styled(format!(" {}", truncate(&name, name_budget)), theme::status());
+
     let used: usize = left.iter().map(|span| span.content.chars().count()).sum();
-    let padding = (area.width as usize).saturating_sub(used + right_text.chars().count());
+    let padding = (area.width as usize)
+        .saturating_sub(used + metrics.chars().count() + position.chars().count());
 
     let mut spans = left;
     spans.push(Span::styled(" ".repeat(padding), theme::status()));
@@ -233,56 +316,70 @@ fn draw_message(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
 }
 
+/// The key guide, as section/keys pairs. An empty section opens a free line.
+const HELP_ROWS: [(&str, &str); 9] = [
+    ("MOVEMENT", "h j k l · w b · 0 $ · gg G"),
+    ("INSERT", "i a I A · o O · Esc"),
+    ("EDIT", "x · dd · yy · p P · u · Ctrl-r"),
+    ("SEARCH", "/text · n next · N previous"),
+    ("FILES", ":w · :w <path> · :w! · :q · :q! · :wq"),
+    ("INTEGRITY", ":hash · :check · :info"),
+    ("DISPLAY", ":set relativenumber · :set number"),
+    ("", ""),
+    ("CLOSE", "Esc · ? · q"),
+];
+
+const HELP_TITLE: &str = " MAAT · QUICK REFERENCE ";
+/// Blank columns left of the key column, right of the box, and between columns.
+const HELP_PADDING: usize = 2;
+
 fn draw_help(frame: &mut Frame) {
-    let area = centered_rect(frame.area(), 74, 22);
+    let width = |text: &str| text.chars().count();
+    let key_column = HELP_ROWS.iter().map(|(key, _)| width(key)).max().unwrap_or(0);
+    let value_column = HELP_ROWS.iter().map(|(_, value)| width(value)).max().unwrap_or(0);
+
+    // Sizing the box to its contents; a fixed 74x22 left nine dead rows and a
+    // trailing void on an 80x25 console.
+    let content_width = HELP_PADDING + key_column + HELP_PADDING + value_column + HELP_PADDING;
+    let box_width = content_width.max(width(HELP_TITLE) + HELP_PADDING) + 2;
+    // One blank row inside each border, plus the borders themselves.
+    let box_height = HELP_ROWS.len() + 2 + 2;
+
+    let area = centered_rect(frame.area(), box_width as u16, box_height as u16);
     frame.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Line::from(Span::styled(
-            " MAAT · QUICK REFERENCE ",
-            theme::overlay_title(),
-        )))
+        .title(Line::from(Span::styled(HELP_TITLE, theme::overlay_title())))
         .border_style(theme::overlay_border())
         .style(theme::overlay());
 
-    let lines = vec![
-        help_line("MOVEMENT", "h j k l · w b · 0 $ · gg G"),
-        help_line("INSERT", "i a I A · o O · Esc"),
-        help_line("EDIT", "x · dd · yy · p P · u · Ctrl-r"),
-        help_line("SEARCH", "/text · n next · N previous"),
-        help_line("FILES", ":w · :w <path> · :w! · :q · :q! · :wq"),
-        help_line("INTEGRITY", ":hash · :check · :info"),
-        help_line("DISPLAY", ":set relativenumber · :set number"),
-        Line::from(""),
+    let indent = " ".repeat(HELP_PADDING);
+    let gap = " ".repeat(HELP_PADDING);
+    // Whatever the box actually got, minus borders, indent, key column and gap.
+    // Values are truncated rather than wrapped: wrapping folds a long entry onto
+    // column zero of the next row and destroys the two-column alignment.
+    let value_budget = (area.width as usize)
+        .saturating_sub(2 + HELP_PADDING + key_column + HELP_PADDING + HELP_PADDING);
+
+    let mut lines = vec![Line::from("")];
+    lines.extend(HELP_ROWS.iter().map(|(key, value)| {
+        if key.is_empty() {
+            return Line::from("");
+        }
+        let style = if *key == "CLOSE" {
+            theme::overlay_dim()
+        } else {
+            theme::overlay()
+        };
         Line::from(vec![
-            Span::styled("SHA-256 WATCH", theme::overlay_key()),
-            Span::styled(
-                "  Maat warns before overwriting external changes.",
-                theme::overlay(),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Esc, ? or q to close",
-            theme::overlay_dim(),
-        )),
-    ];
+            Span::styled(format!("{indent}{key:<key_column$}"), theme::overlay_key()),
+            Span::styled(format!("{gap}{}", truncate(value, value_budget)), style),
+        ])
+    }));
+    lines.push(Line::from(""));
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .style(theme::overlay()),
-        area,
-    );
-}
-
-fn help_line(key: &'static str, description: &'static str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!(" {key:<10}"), theme::overlay_key()),
-        Span::styled(description, theme::overlay()),
-    ])
+    frame.render_widget(Paragraph::new(lines).block(block).style(theme::overlay()), area);
 }
 
 fn centered_rect(parent: Rect, max_width: u16, max_height: u16) -> Rect {
@@ -320,13 +417,130 @@ fn place_cursor(frame: &mut Frame, area: Rect, app: &App, gutter: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::document::Document;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Renders `app` on an 80x25 console — the size of the Linux VGA text
+    /// console Maat actually ships on — and returns the frame as plain text.
+    fn render_at(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                let row: String = (0..width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect();
+                format!("|{}|", row.trim_end())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Row indices of the frame that carry any ink.
+    fn occupied_rows(frame: &str) -> Vec<usize> {
+        frame
+            .lines()
+            .enumerate()
+            .filter(|(_, row)| !row.trim_matches('|').trim().is_empty())
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[test]
+    fn the_welcome_screen_is_vertically_centred() {
+        let mut app = App::new(Document::from_text_for_test(""));
+        let frame = render_at(&mut app, 80, 25);
+        // The last two rows are the status and message bars.
+        let rows = occupied_rows(&frame);
+        let (first, last) = (rows[0], *rows.iter().filter(|row| **row < 23).max().unwrap());
+        let above = first;
+        let below = 23 - last - 1;
+        assert!(
+            above.abs_diff(below) <= 1,
+            "welcome is off-centre: {above} rows above, {below} below\n{frame}"
+        );
+    }
+
+    #[test]
+    fn the_welcome_keys_share_one_column() {
+        let mut app = App::new(Document::from_text_for_test(""));
+        let frame = render_at(&mut app, 80, 25);
+        // Each hint's description starts at the same column, so the keys read as
+        // a column rather than four independently centred lines.
+        let columns: Vec<usize> = frame
+            .lines()
+            .filter_map(|row| row.find("   s").or_else(|| row.find("   o")))
+            .collect();
+        assert_eq!(columns.len(), 4, "expected four hints\n{frame}");
+        assert!(
+            columns.iter().all(|column| *column == columns[0]),
+            "hint descriptions are ragged: {columns:?}\n{frame}"
+        );
+    }
+
+    #[test]
+    fn the_help_overlay_has_no_dead_rows() {
+        let mut app = App::new(Document::from_text_for_test(""));
+        app.show_help = true;
+        let frame = render_at(&mut app, 80, 25);
+        let row_of = |needle: char| {
+            frame
+                .lines()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} border\n{frame}"))
+        };
+        // The box is exactly its contents plus one breathing row inside each
+        // border; a hardcoded height used to leave nine empty rows at the foot.
+        assert_eq!(
+            row_of('└') - row_of('┌'),
+            HELP_ROWS.len() + 3,
+            "help overlay is not sized to its contents\n{frame}"
+        );
+    }
+
+    #[test]
+    fn the_status_bar_never_overflows_its_width() {
+        let long = "a_very_long_generated_filename_indeed.rs";
+        for width in [40u16, 46, 60, 80, 120] {
+            let mut app = App::new(Document::from_text_for_test("hello\nworld"));
+            app.message = long.to_string();
+            let frame = render_at(&mut app, width, 25);
+            for row in frame.lines() {
+                let printed = row.trim_matches('|').chars().count();
+                assert!(
+                    printed <= width as usize,
+                    "row of {printed} cols exceeds {width}\n{frame}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_terminals_keep_the_help_columns_aligned() {
+        let mut app = App::new(Document::from_text_for_test(""));
+        app.show_help = true;
+        let frame = render_at(&mut app, 46, 12);
+        // Truncation, not wrapping: nothing may spill onto a row of its own.
+        let starts: Vec<usize> = frame
+            .lines()
+            .filter(|row| row.contains("MOVEMENT") || row.contains("INSERT") || row.contains("EDIT"))
+            .filter_map(|row| row.find(|c: char| c.is_ascii_uppercase()))
+            .collect();
+        assert_eq!(starts.len(), 3, "expected three key rows\n{frame}");
+        assert!(
+            starts.iter().all(|start| *start == starts[0]),
+            "key column drifts when narrow: {starts:?}\n{frame}"
+        );
+    }
 
     #[test]
     fn gutter_grows_with_the_line_count() {
-        assert_eq!(gutter_width(1), 4);
-        assert_eq!(gutter_width(999), 4);
-        assert_eq!(gutter_width(1000), 5);
-        assert_eq!(gutter_width(12345), 6);
+        assert_eq!(gutter_width(1), 6);
+        assert_eq!(gutter_width(999), 6);
+        assert_eq!(gutter_width(1000), 7);
+        assert_eq!(gutter_width(12345), 8);
     }
 
     #[test]
