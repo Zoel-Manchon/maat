@@ -133,7 +133,14 @@ whole document after every keystroke.
       character it landed on and `d$` takes it — the off-by-one that otherwise
       deletes one character too many, every time. `cw` keeps Vim's irregularity
       and stops at the end of the word.
-- Optional system clipboard.
+- [x] Optional system clipboard, over **OSC 52** rather than a clipboard
+      crate. `arboard` and friends talk to X11, Wayland or Win32, none of which
+      exist on an appliance console reached over SSH; OSC 52 asks the operator's
+      *own* terminal to hold the text, which is the clipboard they actually
+      wanted. Opt-in via `:set clipboard` or `MAAT_CLIPBOARD=1`, because a few
+      old terminals echo the sequence instead of acting on it. Base64 is
+      written out rather than pulled in — a dependency for forty lines of table
+      lookup is a bad trade in a binary meant to stay small and auditable.
 - TOML configuration for theme, tabs and numbers.
 - File picker and multiple buffers.
 
@@ -142,7 +149,14 @@ whole document after every keystroke.
 - Rope or piece table.
 - Incremental syntax highlighting.
 - Recovery journal / swap file.
-- Signed binaries and cross-platform releases.
+- [x] Cross-platform releases: a tag builds six targets (musl x86_64 and
+      aarch64 for the appliance, gnu x86_64, both macOS architectures, and
+      Windows MSVC) and publishes them with a `SHA256SUMS` file — an editor
+      that sells integrity has no business shipping binaries nobody can verify.
+      The musl build is static-pie and around 900 KB.
+- Signing proper. Not done, and not fudged: it needs an Apple Developer ID and
+  an Authenticode certificate. The release notes say so instead of implying the
+  checksums are a signature.
 
 ## Product direction
 

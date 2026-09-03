@@ -1,0 +1,149 @@
+name: Release
+
+# Cutting a release is `git tag v0.4.0 && git push --tags`. Everything below
+# runs from that tag, so what ships is always exactly what the tag points at.
+on:
+  push:
+    tags:
+      - "v*"
+  # Also runnable by hand, to rehearse a release without tagging anything.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (leave empty to build the current ref)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl first: this is the build that goes into an Emberwall
+          # appliance image, where there is no dynamic libc to link against.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      # musl and the aarch64 cross need a linker the runner does not ship.
+      - name: Install cross linkers
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="maat-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/maat.exe" "dist/${name}/"
+          else
+            cp "target/${{ matrix.target }}/release/maat" "dist/${name}/"
+          fi
+          cp README.md LICENSE "dist/${name}/"
+
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${name}.zip" "${name}" > /dev/null
+            archive="${name}.zip"
+          else
+            tar -czf "${name}.tar.gz" "${name}"
+            archive="${name}.tar.gz"
+          fi
+
+          # An editor whose whole pitch is integrity has no business shipping
+          # binaries nobody can verify. Every archive gets a SHA-256 next to it,
+          # in the same format `sha256sum -c` and `maat --verify` speak.
+          if command -v sha256sum > /dev/null; then
+            sha256sum "${archive}" > "${archive}.sha256"
+          else
+            shasum -a 256 "${archive}" > "${archive}.sha256"
+          fi
+          cat "${archive}.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: maat-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Collect every target's archive
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # One checksum file for the whole release, so verifying every download
+      # is a single `sha256sum -c SHA256SUMS`.
+      - name: Merge the checksums
+        run: |
+          cd artifacts
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          cat SHA256SUMS
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          body: |
+            ## Verifying a download
+
+            ```bash
+            sha256sum -c SHA256SUMS --ignore-missing
+            ```
+
+            The archives are **not** code-signed: that needs an Apple Developer
+            ID and an Authenticode certificate, neither of which this project
+            has. On macOS, Gatekeeper will ask; on Windows, SmartScreen may
+            warn. The checksums above are what actually establishes that the
+            binary you have is the one this tag built.

@@ -163,7 +163,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> io::R
         match event::read()? {
             // Windows emits both Press and Release for every key; without
             // this filter each keystroke would count twice.
-            Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                app.handle_key(key);
+                // The editor core never touches the terminal; anything it wants
+                // said to the terminal — an OSC 52 clipboard copy — comes back
+                // here to be written.
+                if let Some(sequence) = app.take_terminal_output() {
+                    let mut stdout = io::stdout();
+                    let _ = stdout.write_all(sequence.as_bytes());
+                    let _ = stdout.flush();
+                }
+            }
             // Arrives as one event thanks to bracketed paste: inserted as
             // text, never interpreted as commands.
             Event::Paste(text) => app.paste_text(&text),

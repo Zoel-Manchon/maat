@@ -10,6 +10,7 @@ use std::path::Path;
 
 use crate::core::audit::{self, SaveEvent};
 use crate::core::buffer::Buffer;
+use crate::core::clipboard;
 use crate::core::cursor::Cursor;
 use crate::core::document::{DiskState, Document};
 use crate::core::mode::Mode;
@@ -271,6 +272,15 @@ pub struct App {
     /// Cached SHA-256 of the buffer: recomputing it every frame would be
     /// costly on large files. Refreshed only after an edit or a history jump.
     hash_cache: String,
+    /// Send yanks to the terminal's clipboard with OSC 52. Off by default: a
+    /// handful of old terminals echo the sequence as text instead of acting on
+    /// it, and printing garbage into someone's session is worse than making
+    /// them ask for the feature.
+    pub clipboard: bool,
+    /// Text waiting to be handed to the terminal. `App` never writes to the
+    /// screen — that is the property that lets every one of these tests run
+    /// without a terminal — so the event loop drains this instead.
+    clipboard_out: Option<String>,
     pub quit: bool,
     /// True when the session ended via `:q!` with unsaved changes on the table.
     /// `visudo` and friends rely on a non-zero exit to know the edit was
@@ -302,6 +312,8 @@ impl App {
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             hash_cache,
+            clipboard: std::env::var("MAAT_CLIPBOARD").is_ok_and(|value| value != "0"),
+            clipboard_out: None,
             quit: false,
             discarded: false,
         }
@@ -309,6 +321,32 @@ impl App {
 
     pub fn hash(&self) -> &str {
         &self.hash_cache
+    }
+
+    /// Hands the event loop anything the terminal should be told, and forgets
+    /// it. Called once per key, so a yank reaches the clipboard on the same
+    /// keystroke that filled the register.
+    pub fn take_terminal_output(&mut self) -> Option<String> {
+        self.clipboard_out.take()
+    }
+
+    /// Mirrors whatever just entered the register onto the system clipboard.
+    ///
+    /// Called from every place that writes the register, so `yy`, `dw`, a
+    /// visual yank and a delete all behave the same — a rule with an exception
+    /// is a rule nobody can predict.
+    fn mirror_register_to_clipboard(&mut self) {
+        if !self.clipboard {
+            return;
+        }
+        let text = match &self.register {
+            Some(Register::Chars(text)) => text.clone(),
+            // Line-wise registers carry a trailing newline, the way they would
+            // if you had selected the lines in another application.
+            Some(Register::Lines(lines)) => format!("{}\n", lines.join("\n")),
+            None => return,
+        };
+        self.clipboard_out = Some(clipboard::osc52_copy(&text));
     }
 
     pub fn is_modified(&self) -> bool {
@@ -501,11 +539,13 @@ impl App {
                 .collect();
             let count = lines.len();
             self.register = Some(Register::Lines(lines));
+            self.mirror_register_to_clipboard();
             self.notify(count_message(count, "yanked"), Level::Info);
         } else {
             let text = self.document.buffer.range_text(start, end);
             let chars = text.chars().count();
             self.register = Some(Register::Chars(text));
+            self.mirror_register_to_clipboard();
             let noun = if chars == 1 { "character" } else { "characters" };
             self.notify(format!("{chars} {noun} yanked"), Level::Info);
         }
@@ -528,6 +568,7 @@ impl App {
                 .collect();
             let removed = lines.len();
             self.register = Some(Register::Lines(lines));
+            self.mirror_register_to_clipboard();
             self.cursor = Cursor { row: start.0, col: 0 };
             for _ in 0..removed {
                 self.document.buffer.delete_line(start.0);
@@ -542,6 +583,7 @@ impl App {
             let text = self.document.buffer.range_text(start, end);
             let chars = text.chars().count();
             self.register = Some(Register::Chars(text));
+            self.mirror_register_to_clipboard();
             self.document.buffer.delete_range(start, end);
             self.cursor = Cursor { row: start.0, col: start.1 };
             let noun = if chars == 1 { "character" } else { "characters" };
@@ -1124,6 +1166,7 @@ impl App {
         }
         let removed = lines.len();
         self.register = Some(Register::Lines(lines));
+        self.mirror_register_to_clipboard();
 
         if operator == Operator::Yank {
             self.cursor = Cursor { row: first, col: 0 };
@@ -1157,6 +1200,7 @@ impl App {
         }
         let chars = text.chars().count();
         self.register = Some(Register::Chars(text));
+        self.mirror_register_to_clipboard();
         let noun = if chars == 1 { "character" } else { "characters" };
 
         if operator == Operator::Yank {
@@ -1212,44 +1256,6 @@ impl App {
             self.document.buffer.delete_char(self.cursor.row, self.cursor.col);
         }
         self.after_edit();
-    }
-
-    /// The lines a counted line-wise operator would cover, clamped to the end
-    /// of the buffer: `9dd` near the bottom deletes what is left, like Vim.
-    fn lines_from_cursor(&self, count: usize) -> Vec<String> {
-        let last = self.document.buffer.line_count();
-        (self.cursor.row..(self.cursor.row + count).min(last))
-            .filter_map(|row| self.document.buffer.line(row).map(str::to_string))
-            .collect()
-    }
-
-    /// `Ndd`.
-    fn delete_lines(&mut self, count: usize) {
-        let lines = self.lines_from_cursor(count);
-        if lines.is_empty() {
-            return;
-        }
-
-        self.checkpoint();
-        let removed = lines.len();
-        self.register = Some(Register::Lines(lines));
-        for _ in 0..removed {
-            self.document.buffer.delete_line(self.cursor.row);
-        }
-        self.after_edit();
-        self.notify(count_message(removed, "deleted and yanked"), Level::Info);
-    }
-
-    /// `Nyy`.
-    fn yank_lines(&mut self, count: usize) {
-        let lines = self.lines_from_cursor(count);
-        if lines.is_empty() {
-            return;
-        }
-
-        let yanked = lines.len();
-        self.register = Some(Register::Lines(lines));
-        self.notify(count_message(yanked, "yanked"), Level::Info);
     }
 
     /// `p` / `P` in Normal mode. Line registers open new lines; character
@@ -1332,6 +1338,14 @@ impl App {
             "set number" | "set nornu" => {
                 self.relative_numbers = false;
                 self.notify("absolute line numbers on", Level::Info);
+            }
+            "set clipboard" => {
+                self.clipboard = true;
+                self.notify("yanks now go to the terminal clipboard (OSC 52)", Level::Info);
+            }
+            "set noclipboard" => {
+                self.clipboard = false;
+                self.notify("yanks stay in the editor's register", Level::Info);
             }
             "" => {}
             other => {
@@ -1823,6 +1837,70 @@ mod tests {
 
         keys(&mut app, "l");
         assert_eq!(app.cursor.col, 1, "one step, not three");
+    }
+
+    // ── System clipboard (OSC 52) ───────────────────────────────
+
+    #[test]
+    fn nothing_reaches_the_terminal_while_the_clipboard_is_off() {
+        let mut app = app_with("uno\ndos");
+        assert!(!app.clipboard, "off unless asked for");
+
+        keys(&mut app, "yy");
+        assert_eq!(app.take_terminal_output(), None);
+    }
+
+    #[test]
+    fn a_yank_is_mirrored_to_the_terminal_clipboard() {
+        let mut app = app_with("uno\ndos");
+        command(&mut app, "set clipboard");
+
+        keys(&mut app, "yy");
+        let sequence = app.take_terminal_output().expect("an OSC 52 sequence");
+        assert!(sequence.starts_with("\x1b]52;c;"));
+        // "uno\n" in base64.
+        assert!(sequence.contains("dW5vCg=="));
+    }
+
+    #[test]
+    fn a_visual_yank_mirrors_only_the_span() {
+        let mut app = app_with("uno dos");
+        command(&mut app, "set clipboard");
+
+        keys(&mut app, "vly"); // "un"
+        let sequence = app.take_terminal_output().expect("an OSC 52 sequence");
+        assert!(sequence.contains("dW4="), "expected base64 of \"un\"");
+    }
+
+    #[test]
+    fn a_delete_reaches_the_clipboard_too() {
+        // Same rule for every path that fills the register: a rule with an
+        // exception is one nobody can predict.
+        let mut app = app_with("uno dos");
+        command(&mut app, "set clipboard");
+
+        keys(&mut app, "dw");
+        assert!(app.take_terminal_output().is_some());
+    }
+
+    #[test]
+    fn the_output_is_taken_once_and_not_repeated() {
+        let mut app = app_with("uno");
+        command(&mut app, "set clipboard");
+
+        keys(&mut app, "yy");
+        assert!(app.take_terminal_output().is_some());
+        assert_eq!(app.take_terminal_output(), None, "already delivered");
+    }
+
+    #[test]
+    fn the_clipboard_can_be_turned_back_off() {
+        let mut app = app_with("uno");
+        command(&mut app, "set clipboard");
+        command(&mut app, "set noclipboard");
+
+        keys(&mut app, "yy");
+        assert_eq!(app.take_terminal_output(), None);
     }
 
     // ── Operators over motions ──────────────────────────────────

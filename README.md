@@ -48,6 +48,7 @@ stop being.
 - Register that remembers whether it holds lines or a character span.
 - CRLF and LF line endings preserved exactly as the file had them.
 - Bracketed paste: a pasted block is inserted as text, never run as commands.
+- System clipboard over **OSC 52** — works through SSH, needs no display server.
 - External-change detection before save; explicit `:w!` override.
 - Live SHA-256 fingerprint and `:check` integrity command.
 - Integrated `?` help panel and a branded welcome screen.
@@ -144,6 +145,8 @@ The destination directory must already exist.
 | `:info` | Show path, lines, words and characters |
 | `:set relativenumber` | Enable relative line numbers |
 | `:set number` | Restore absolute line numbers |
+| `:set clipboard` | Mirror yanks to the terminal clipboard (OSC 52) |
+| `:set noclipboard` | Keep yanks in the editor's register only |
 | `:help` | Open the quick reference |
 
 ## Command line
