@@ -30,6 +30,57 @@ struct Snapshot {
     cursor: Cursor,
 }
 
+/// An operator waiting for something to act on.
+///
+/// Vim's grammar is `[count] operator [count] motion`, and the whole point is
+/// that the two halves are independent: every operator works with every motion,
+/// so `dw`, `d$`, `c3w` and `dG` do not each need their own case. Modelling the
+/// operator as state — rather than hard-coding `dd` and `yy` — is what makes
+/// that composition real instead of a list of special cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Operator {
+    Delete,
+    Yank,
+    Change,
+}
+
+impl Operator {
+    fn key(self) -> char {
+        match self {
+            Operator::Delete => 'd',
+            Operator::Yank => 'y',
+            Operator::Change => 'c',
+        }
+    }
+}
+
+/// A multi-key sequence in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    /// `g` typed, waiting for the second one.
+    GotoG,
+    /// An operator typed, waiting for a motion (or its own key, for the
+    /// line-wise `dd` / `yy` / `cc` form).
+    Operator(Operator),
+    /// An operator and then `g`, waiting for the `gg` that completes `dgg`.
+    OperatorGotoG(Operator),
+}
+
+/// How far a motion reaches when an operator is applied to it.
+///
+/// The distinction is not decoration: `dw` must not eat the character the
+/// cursor lands on, while `d$` must take the last one. Getting this wrong is
+/// the classic off-by-one that deletes one character too many, every time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MotionKind {
+    /// Up to, but not including, where the motion landed.
+    Exclusive,
+    /// Including the character the motion landed on.
+    Inclusive,
+    /// Whole lines, whatever the columns.
+    LineWise,
+}
+
 /// What the register holds, and therefore how `p` puts it back.
 ///
 /// Vim's distinction, and it matters: `yy` on one line and `vwy` over a word
@@ -122,6 +173,43 @@ fn parse_substitution(command: &str) -> Option<Substitution> {
     })
 }
 
+/// Turns "where the motion started" and "where it landed" into the inclusive
+/// span an operator should act on.
+///
+/// Returns `None` when the span is empty — a motion that went nowhere must not
+/// delete the character it is sitting on.
+fn char_span(
+    start: Cursor,
+    end: Cursor,
+    kind: MotionKind,
+    buffer: &Buffer,
+) -> Option<((usize, usize), (usize, usize))> {
+    let a = (start.row, start.col);
+    let b = (end.row, end.col);
+    if a == b && kind == MotionKind::Exclusive {
+        return None;
+    }
+
+    let (from, to) = if a <= b { (a, b) } else { (b, a) };
+
+    if kind == MotionKind::Inclusive {
+        return Some((from, to));
+    }
+
+    // Exclusive: the far end is not part of the span, so step back one
+    // character — across the line break if the motion started a new line.
+    let to = if to.1 > 0 {
+        (to.0, to.1 - 1)
+    } else if to.0 > from.0 {
+        let previous = to.0 - 1;
+        (previous, buffer.line_len(previous).saturating_sub(1))
+    } else {
+        return None;
+    };
+
+    (from <= to).then_some((from, to))
+}
+
 /// "1 line yanked" / "3 lines yanked" — singular and plural, so the status bar
 /// never reads like a placeholder.
 fn count_message(lines: usize, what: &str) -> String {
@@ -167,8 +255,8 @@ pub struct App {
     pub level: Level,
     pub show_help: bool,
     pub relative_numbers: bool,
-    /// Pending key of a two-stroke command (`gg`, `dd`, `yy`).
-    pending: Option<char>,
+    /// A multi-key sequence in progress: `gg`, or an operator awaiting a motion.
+    pending: Option<Pending>,
     /// Digits typed before a command: the `3` in `3dd`. `None` until the first
     /// digit, which is what lets `0` keep meaning "start of line".
     count: Option<usize>,
@@ -488,7 +576,7 @@ impl App {
             }
         }
 
-        if let Some('g') = self.pending.take() {
+        if let Some(Pending::GotoG) = self.pending.take() {
             if key.code == KeyCode::Char('g') {
                 self.count = None;
                 self.cursor.buffer_start();
@@ -519,7 +607,7 @@ impl App {
                 true => self.goto_line(count),
                 false => self.cursor.buffer_end(&self.document.buffer, self.mode),
             },
-            KeyCode::Char('g') => self.pending = Some('g'),
+            KeyCode::Char('g') => self.pending = Some(Pending::GotoG),
             KeyCode::Char('w') => self.repeat(count, |app| app.word_forward()),
             KeyCode::Char('b') => self.repeat(count, |app| app.word_back()),
 
@@ -625,27 +713,40 @@ impl App {
             }
         }
 
-        // Two-stroke commands: if one is pending, this key completes it.
-        if let Some(first) = self.pending.take() {
-            match (first, key.code) {
-                ('g', KeyCode::Char('g')) => {
-                    self.count = None;
-                    self.cursor.buffer_start();
-                    return;
+        // A sequence in progress: this key either completes it or aborts it.
+        if let Some(pending) = self.pending.take() {
+            match pending {
+                Pending::GotoG => {
+                    if key.code == KeyCode::Char('g') {
+                        self.count = None;
+                        self.cursor.buffer_start();
+                        return;
+                    }
+                    // Not a `gg`: fall through and treat this key normally.
                 }
-                ('d', KeyCode::Char('d')) => {
+                Pending::OperatorGotoG(operator) => {
+                    if key.code == KeyCode::Char('g') {
+                        self.count = None;
+                        let first_row = 0;
+                        let last_row = self.cursor.row;
+                        self.apply_operator_linewise(operator, first_row, last_row);
+                        return;
+                    }
+                    return; // `dg` followed by anything else does nothing
+                }
+                Pending::Operator(operator) => {
+                    // The operator's own key repeated is the line-wise form:
+                    // `dd`, `yy`, `cc`.
+                    if key.code == KeyCode::Char(operator.key()) {
+                        let count = self.take_count();
+                        let last = self.cursor.row + count.saturating_sub(1);
+                        self.apply_operator_linewise(operator, self.cursor.row, last);
+                        return;
+                    }
                     let count = self.take_count();
-                    self.delete_lines(count);
+                    let had_count = count > 1;
+                    self.apply_operator_motion(operator, key, count, had_count);
                     return;
-                }
-                ('y', KeyCode::Char('y')) => {
-                    let count = self.take_count();
-                    self.yank_lines(count);
-                    return;
-                }
-                _ => {
-                    // Sequence aborted: this key is processed as a normal one,
-                    // and the count it may have carried goes with it.
                 }
             }
         }
@@ -680,7 +781,7 @@ impl App {
                 true => self.goto_line(count),
                 false => self.cursor.buffer_end(&self.document.buffer, self.mode),
             },
-            KeyCode::Char('g') => self.pending = Some('g'),
+            KeyCode::Char('g') => self.pending = Some(Pending::GotoG),
             KeyCode::Char('w') => self.repeat(count, |app| app.word_forward()),
             KeyCode::Char('b') => self.repeat(count, |app| app.word_back()),
 
@@ -716,15 +817,19 @@ impl App {
 
             // Editing / register
             KeyCode::Char('x') => self.delete_chars(count),
+            // The count belongs to the whole `3dd`, so it has to survive the
+            // wait for the motion.
             KeyCode::Char('d') => {
-                // The count belongs to the whole `3dd`, so it has to survive
-                // the wait for the second key.
                 self.count = key_had_count.then_some(count);
-                self.pending = Some('d');
+                self.pending = Some(Pending::Operator(Operator::Delete));
             }
             KeyCode::Char('y') => {
                 self.count = key_had_count.then_some(count);
-                self.pending = Some('y');
+                self.pending = Some(Pending::Operator(Operator::Yank));
+            }
+            KeyCode::Char('c') => {
+                self.count = key_had_count.then_some(count);
+                self.pending = Some(Pending::Operator(Operator::Change));
             }
             KeyCode::Char('p') => self.paste_line(false, count),
             KeyCode::Char('P') => self.paste_line(true, count),
@@ -911,6 +1016,163 @@ impl App {
 
         self.after_edit();
         self.notify(count_message(lines.len(), "pasted"), Level::Info);
+    }
+
+    // ── Operators over motions ──────────────────────────────────
+
+    /// Runs the motion, then applies the operator to the span it covered.
+    ///
+    /// The motion is executed for real — cursor and all — and the span is the
+    /// distance travelled. That is what keeps `dw` and `w` in agreement: there
+    /// is one implementation of "where does w go", not two.
+    fn apply_operator_motion(
+        &mut self,
+        operator: Operator,
+        key: KeyEvent,
+        count: usize,
+        had_count: bool,
+    ) {
+        let start = self.cursor;
+
+        let kind = match key.code {
+            KeyCode::Char('w') => {
+                // Vim's one famous irregularity: `cw` changes the word, not up
+                // to the next one, so it does not swallow the space after it.
+                if operator == Operator::Change {
+                    self.repeat(count, |app| app.word_end());
+                    MotionKind::Inclusive
+                } else {
+                    self.repeat(count, |app| app.word_forward());
+                    MotionKind::Exclusive
+                }
+            }
+            KeyCode::Char('b') => {
+                self.repeat(count, |app| app.word_back());
+                MotionKind::Exclusive
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.repeat(count, |app| app.cursor.left());
+                MotionKind::Exclusive
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.repeat(count, |app| app.cursor.right(&app.document.buffer, app.mode));
+                MotionKind::Inclusive
+            }
+            KeyCode::Char('0') | KeyCode::Home => {
+                self.cursor.line_start();
+                MotionKind::Exclusive
+            }
+            KeyCode::Char('$') | KeyCode::End => {
+                self.cursor.line_end(&self.document.buffer, self.mode);
+                MotionKind::Inclusive
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.repeat(count, |app| app.cursor.down(&app.document.buffer, app.mode));
+                MotionKind::LineWise
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.repeat(count, |app| app.cursor.up(&app.document.buffer, app.mode));
+                MotionKind::LineWise
+            }
+            KeyCode::Char('G') => {
+                if had_count {
+                    self.goto_line(count);
+                } else {
+                    self.cursor.buffer_end(&self.document.buffer, self.mode);
+                }
+                MotionKind::LineWise
+            }
+            KeyCode::Char('g') => {
+                // `dg` needs one more key to become `dgg`.
+                self.pending = Some(Pending::OperatorGotoG(operator));
+                return;
+            }
+            // Anything else aborts: an operator followed by a key that is not a
+            // motion must do nothing at all, not guess.
+            _ => return,
+        };
+
+        let end = self.cursor;
+        self.cursor = start;
+
+        match kind {
+            MotionKind::LineWise => {
+                let (first, last) = if start.row <= end.row {
+                    (start.row, end.row)
+                } else {
+                    (end.row, start.row)
+                };
+                self.apply_operator_linewise(operator, first, last);
+            }
+            _ => {
+                let Some((from, to)) = char_span(start, end, kind, &self.document.buffer) else {
+                    return;
+                };
+                self.apply_operator_charwise(operator, from, to);
+            }
+        }
+    }
+
+    /// Delete / yank / change over whole lines.
+    fn apply_operator_linewise(&mut self, operator: Operator, first: usize, last: usize) {
+        let last = last.min(self.document.buffer.line_count().saturating_sub(1));
+        let lines: Vec<String> = (first..=last)
+            .filter_map(|row| self.document.buffer.line(row).map(str::to_string))
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+        let removed = lines.len();
+        self.register = Some(Register::Lines(lines));
+
+        if operator == Operator::Yank {
+            self.cursor = Cursor { row: first, col: 0 };
+            self.notify(count_message(removed, "yanked"), Level::Info);
+            return;
+        }
+
+        self.checkpoint();
+        for _ in 0..removed {
+            self.document.buffer.delete_line(first);
+        }
+        if operator == Operator::Change {
+            self.document.buffer.insert_line(first, String::new());
+            self.mode = Mode::Insert;
+        }
+        self.cursor = Cursor { row: first, col: 0 };
+        self.after_edit();
+        self.notify(count_message(removed, "deleted and yanked"), Level::Info);
+    }
+
+    /// Delete / yank / change over an inclusive character span.
+    fn apply_operator_charwise(
+        &mut self,
+        operator: Operator,
+        from: (usize, usize),
+        to: (usize, usize),
+    ) {
+        let text = self.document.buffer.range_text(from, to);
+        if text.is_empty() {
+            return;
+        }
+        let chars = text.chars().count();
+        self.register = Some(Register::Chars(text));
+        let noun = if chars == 1 { "character" } else { "characters" };
+
+        if operator == Operator::Yank {
+            self.cursor = Cursor { row: from.0, col: from.1 };
+            self.notify(format!("{chars} {noun} yanked"), Level::Info);
+            return;
+        }
+
+        self.checkpoint();
+        self.document.buffer.delete_range(from, to);
+        self.cursor = Cursor { row: from.0, col: from.1 };
+        if operator == Operator::Change {
+            self.mode = Mode::Insert;
+        }
+        self.after_edit();
+        self.notify(format!("{chars} {noun} deleted and yanked"), Level::Info);
     }
 
     /// Runs a motion `count` times.
@@ -1349,6 +1611,29 @@ impl App {
         }
     }
 
+    /// The last character of the current word — where `cw` stops.
+    ///
+    /// `w` lands on the *next* word, which is why `dw` takes the trailing
+    /// space; `cw` is expected to leave it, so it needs its own end point.
+    fn word_end(&mut self) {
+        let Some(line) = self.document.buffer.line(self.cursor.row) else { return };
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            return;
+        }
+        let mut index = self.cursor.col;
+
+        // Skip any whitespace the cursor is sitting in, then run to the end of
+        // the word that follows.
+        while index < chars.len() && chars[index].is_whitespace() {
+            index += 1;
+        }
+        while index + 1 < chars.len() && !chars[index + 1].is_whitespace() {
+            index += 1;
+        }
+        self.cursor.col = index.min(chars.len().saturating_sub(1));
+    }
+
     fn word_back(&mut self) {
         if self.cursor.col == 0 {
             if self.cursor.row > 0 {
@@ -1538,6 +1823,130 @@ mod tests {
 
         keys(&mut app, "l");
         assert_eq!(app.cursor.col, 1, "one step, not three");
+    }
+
+    // ── Operators over motions ──────────────────────────────────
+
+    #[test]
+    fn dw_deletes_a_word_and_the_space_after_it() {
+        let mut app = app_with("uno dos tres");
+        keys(&mut app, "dw");
+        assert_eq!(app.document.buffer.line(0), Some("dos tres"));
+    }
+
+    #[test]
+    fn a_count_between_operator_and_motion_works() {
+        let mut app = app_with("uno dos tres cuatro");
+        keys(&mut app, "d2w");
+        assert_eq!(app.document.buffer.line(0), Some("tres cuatro"));
+    }
+
+    #[test]
+    fn a_count_before_the_operator_works_too() {
+        let mut app = app_with("uno dos tres cuatro");
+        keys(&mut app, "2dw");
+        assert_eq!(app.document.buffer.line(0), Some("tres cuatro"));
+    }
+
+    #[test]
+    fn cw_changes_the_word_without_swallowing_the_space() {
+        // Vim's famous irregularity, and the one people notice immediately.
+        let mut app = app_with("uno dos");
+        keys(&mut app, "cw");
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.document.buffer.line(0), Some(" dos"));
+
+        keys(&mut app, "XYZ");
+        assert_eq!(app.document.buffer.line(0), Some("XYZ dos"));
+    }
+
+    #[test]
+    fn d_dollar_deletes_to_the_end_of_the_line_inclusive() {
+        let mut app = app_with("hola mundo");
+        keys(&mut app, "lllll"); // on 'm'
+        keys(&mut app, "d$");
+        assert_eq!(app.document.buffer.line(0), Some("hola "));
+    }
+
+    #[test]
+    fn d_zero_deletes_back_to_the_start_of_the_line_exclusive() {
+        let mut app = app_with("hola mundo");
+        keys(&mut app, "lllll"); // on 'm'
+        keys(&mut app, "d0");
+        assert_eq!(app.document.buffer.line(0), Some("mundo"));
+    }
+
+    #[test]
+    fn dj_and_dk_are_line_wise() {
+        let mut app = app_with("uno\ndos\ntres");
+        keys(&mut app, "dj");
+        assert_eq!(app.document.buffer.to_text(), "tres");
+
+        let mut app = app_with("uno\ndos\ntres");
+        keys(&mut app, "jjdk");
+        assert_eq!(app.document.buffer.to_text(), "uno");
+    }
+
+    #[test]
+    fn dg_deletes_from_the_cursor_to_the_end_and_dgg_to_the_start() {
+        let mut app = app_with("uno\ndos\ntres");
+        keys(&mut app, "jdG");
+        assert_eq!(app.document.buffer.to_text(), "uno");
+
+        let mut app = app_with("uno\ndos\ntres");
+        keys(&mut app, "jdgg");
+        assert_eq!(app.document.buffer.to_text(), "tres");
+    }
+
+    #[test]
+    fn yw_yanks_without_touching_the_text() {
+        let mut app = app_with("uno dos");
+        keys(&mut app, "yw");
+        assert_eq!(app.document.buffer.line(0), Some("uno dos"), "yank never edits");
+        assert_eq!(app.message, "4 characters yanked");
+
+        keys(&mut app, "$p");
+        assert_eq!(app.document.buffer.line(0), Some("uno dosuno "));
+    }
+
+    #[test]
+    fn the_line_wise_forms_still_work() {
+        let mut app = app_with("uno\ndos\ntres");
+        keys(&mut app, "2dd");
+        assert_eq!(app.document.buffer.to_text(), "tres");
+
+        let mut app = app_with("uno\ndos");
+        keys(&mut app, "cc");
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.document.buffer.to_text(), "\ndos");
+    }
+
+    #[test]
+    fn an_operator_followed_by_a_non_motion_does_nothing() {
+        let mut app = app_with("uno dos");
+        keys(&mut app, "d");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.document.buffer.line(0), Some("uno dos"));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // And the editor is not left waiting for anything.
+        keys(&mut app, "l");
+        assert_eq!(app.cursor.col, 1);
+    }
+
+    #[test]
+    fn an_operator_over_a_motion_that_goes_nowhere_changes_nothing() {
+        let mut app = app_with("uno");
+        keys(&mut app, "d0"); // already at column zero
+        assert_eq!(app.document.buffer.line(0), Some("uno"));
+    }
+
+    #[test]
+    fn an_operator_and_a_motion_are_one_undo_step() {
+        let mut app = app_with("uno dos tres");
+        keys(&mut app, "d2w");
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.document.buffer.line(0), Some("uno dos tres"));
     }
 
     // ── Visual mode ─────────────────────────────────────────────

@@ -127,7 +127,12 @@ whole document after every keystroke.
       `d` / `y` / `c` / `p` over the selection. The register now remembers
       whether it holds lines or a character span, so a visual yank pastes
       beside the cursor and a `yy` still opens a new line.
-- Composable operators and motions.
+- [x] Composable operators and motions: `d`, `y` and `c` take any motion, with
+      a count on either side (`2dw` and `d2w` both work). Exclusive, inclusive
+      and line-wise motions are modelled explicitly, so `dw` leaves the
+      character it landed on and `d$` takes it — the off-by-one that otherwise
+      deletes one character too many, every time. `cw` keeps Vim's irregularity
+      and stops at the end of the word.
 - Optional system clipboard.
 - TOML configuration for theme, tabs and numbers.
 - File picker and multiple buffers.

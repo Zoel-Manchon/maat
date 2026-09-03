@@ -40,6 +40,7 @@ stop being.
 - Normal, Insert, Command, Search and Visual modes.
 - Vim-inspired motions: `hjkl`, `w`, `b`, `0`, `$`, `gg`, `G`, `12G`.
 - Counts before any motion or operator: `3j`, `5x`, `2dd`, `3p`.
+- Operators compose with motions: `dw`, `c3w`, `d$`, `d0`, `dG`, `dgg`, `yw`.
 - Visual selection: `v` character-wise, `V` line-wise, with `d`, `y`, `c`, `p`.
 - Literal substitution: `:s/old/new/`, `/g`, and `:%s` for the whole file.
 - Incremental `/search`, highlighted matches and `n` / `N` navigation.
@@ -101,8 +102,8 @@ The destination directory must already exist.
 | `i a I A` | Enter Insert mode |
 | `o` / `O` | Open line below / above |
 | `x` | Delete character |
-| `dd` | Delete and copy current line |
-| `yy` | Copy current line |
+| `dd` / `yy` / `cc` | Delete / copy / change the whole line |
+| `d` `y` `c` + motion | `dw` `c3w` `d$` `d0` `dG` `dgg` `yw` |
 | `p` / `P` | Paste below / above |
 | `u` / `Ctrl-r` | Undo / redo |
 | `/` | Search |
