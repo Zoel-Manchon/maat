@@ -380,12 +380,17 @@ pull requests. Formatting and Clippy remain recommended local pre-commit checks.
 - [x] CRLF/LF line endings preserved across a save.
 - [x] Bracketed paste, and a terminal that survives a panic.
 - [x] Visual mode (`v` / `V`) with character-wise and line-wise operators.
-- [ ] Configurable key map, theme and editor options.
+- [x] Operators composed with motions: `dw`, `c3w`, `d$`, `dG`, `dgg`, `yw`.
+- [x] System clipboard over OSC 52 — works through SSH, no display server.
+- [x] `config.toml` for theme, tabs, numbers and editor options.
+- [x] Recovery journal: `:recover` / `:discard` after an interrupted session.
+- [x] Release binaries for Linux (musl and gnu), macOS and Windows, with
+      `SHA256SUMS`. Code signing still needs certificates this project has not.
+- [ ] Configurable **key map** — the theme and editor options are configurable
+      today, rebinding keys is not.
 - [ ] Syntax highlighting with language detection.
 - [ ] Tabs, multiple buffers and a file picker.
 - [ ] Rope or piece-table storage for large files.
-- [ ] Recovery journal / swap file.
-- [ ] Release binaries for Linux, macOS and Windows.
 
 See [`docs/project-review.md`](docs/project-review.md) for the technical review
 and design priorities.

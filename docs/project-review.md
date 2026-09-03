@@ -148,12 +148,21 @@ whole document after every keystroke.
       `toml` + `serde`: a dozen scalars are not worth quadrupling a three-crate
       dependency tree in a binary that has to stay small and auditable. Keys it
       does not recognise are reported on the message line, not swallowed.
-- File picker and multiple buffers.
+- File picker and multiple buffers. **Still open.** `App` owns exactly one
+  `Document` today; multiple buffers means a buffer list, per-buffer cursors
+  and history, and a UI for switching — the largest single piece left.
 
 ### 0.5
 
-- Rope or piece table.
-- Incremental syntax highlighting.
+- Rope or piece table. **Still open**, and the honest reason is that it is a
+  rewrite rather than an addition: `Vec<String>` is fine to tens of thousands
+  of lines, and the change only pays off alongside the operation-based history
+  in priority 2 and lazy hashing. Doing it before those two would mean doing it
+  twice.
+- Incremental syntax highlighting. **Still open.** Needs a lexer per language
+  and a dirty-range model in the renderer; the current `highlight_line` splits
+  a line by one literal query, which is the right shape for search and the
+  wrong one for a grammar.
 - [x] Recovery journal. Unsaved work is mirrored to
       `$XDG_STATE_HOME/maat/swap` every twenty edits and on a clean quit, and
       deleted the moment it is on disk — so a journal that outlives its session
