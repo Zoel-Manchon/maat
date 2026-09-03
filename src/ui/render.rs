@@ -367,7 +367,7 @@ fn draw_message(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// The key guide, as section/keys pairs. An empty section opens a free line.
-const HELP_ROWS: [(&str, &str); 14] = [
+const HELP_ROWS: [(&str, &str); 15] = [
     ("MOVEMENT", "h j k l · w b · 0 $ · gg G · 12G"),
     ("COUNTS", "3j · 5x · 2dd · 3p — before any of the above"),
     ("INSERT", "i a I A · o O · Esc"),
@@ -379,6 +379,7 @@ const HELP_ROWS: [(&str, &str); 14] = [
     ("REPLACE", ":s/old/new/ · :s/old/new/g · :%s/old/new/g"),
     ("FILES", ":w · :w <path> · :w! · :q · :q! · :wq"),
     ("INTEGRITY", ":hash · :check · :info"),
+    ("RECOVERY", ":recover · :discard"),
     ("DISPLAY", ":set relativenumber · :set number"),
     ("", ""),
     ("CLOSE", "Esc · ? · q"),

@@ -142,7 +142,9 @@ The destination directory must already exist.
 | `:%s/old/new/g` | Replace every match in the file |
 | `:hash` | Show full buffer SHA-256 |
 | `:check` | Compare the file with the last known disk state |
-| `:info` | Show path, lines, words and characters |
+| `:info` | Show path, lines, words, characters and line ending |
+| `:recover` | Load unsaved work left by an interrupted session |
+| `:discard` | Throw that journal away |
 | `:set relativenumber` | Enable relative line numbers |
 | `:set number` | Restore absolute line numbers |
 | `:set clipboard` | Mirror yanks to the terminal clipboard (OSC 52) |
@@ -177,6 +179,32 @@ state: unchanged
 
 Exit code `2` is what makes Maat safe as `$EDITOR`: `visudo` and `crontab -e`
 read it to know they must not install a half-edited file.
+
+## Crash recovery
+
+Atomic saves guarantee a crash cannot leave a half-written *file*. They say
+nothing about the twenty minutes of editing that only ever existed in memory.
+So maat mirrors unsaved work to a journal under `$XDG_STATE_HOME/maat/swap`
+(`$MAAT_STATE` overrides it), and deletes it the moment the work is on disk.
+
+A journal that outlives its session is therefore a statement: this buffer had
+unsaved changes when the editor stopped. The next time you open the file, maat
+says so and waits:
+
+```console
+unsaved changes from an interrupted session — :recover to load them, :discard to drop them
+```
+
+`:recover` loads the work back into the buffer and leaves it **unsaved** — the
+file on disk is untouched, `u` undoes the recovery, and writing it out is still
+a `:w` you type, with the usual integrity check in the way. If the file also
+changed on disk since the journal was taken, the warning is louder: restoring
+would otherwise silently overwrite whatever the other party wrote, which is the
+exact failure this editor exists to prevent.
+
+It is not a lock file. maat will not stop a second editor from opening the same
+path: a stale lock on an appliance turns a recoverable situation into one that
+needs someone who knows to go and delete a file.
 
 ## Configuration
 

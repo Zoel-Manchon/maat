@@ -125,6 +125,10 @@ fn edit(path: Option<PathBuf>) -> io::Result<ExitCode> {
         app.warn_about_config(&first, extra);
     }
 
+    // Before the first frame, so an interrupted session is the first thing the
+    // user is told about.
+    app.check_for_recovery();
+
     install_panic_hook();
 
     let mut terminal = setup_terminal()?;

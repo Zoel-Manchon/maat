@@ -12,9 +12,14 @@ use crate::core::audit::{self, SaveEvent};
 use crate::core::buffer::Buffer;
 use crate::core::clipboard;
 use crate::core::config::Config;
+use crate::core::journal::Journal;
 use crate::core::cursor::Cursor;
 use crate::core::document::{DiskState, Document};
 use crate::core::mode::Mode;
+
+/// Edits between journal writes. Small enough that a crash costs a sentence,
+/// large enough that the editor is not writing a file on every keystroke.
+const JOURNAL_EVERY: usize = 20;
 
 /// Severity of the message shown on the bottom line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +290,15 @@ pub struct App {
     pub expand_tabs: bool,
     /// Undo snapshots kept, from the config.
     history_limit: usize,
+    /// Where unsaved work is mirrored so a crash does not take it with it.
+    /// `None` when there is nowhere writable to put it.
+    journal: Option<Journal>,
+    /// Edits since the journal was last written. Writing on every keystroke
+    /// would turn one file write per character; this batches them.
+    edits_since_journal: usize,
+    /// A journal from a previous session, waiting for `:recover` or
+    /// `:discard`. Kept here so the message line can keep mentioning it.
+    pub pending_recovery: bool,
     pub quit: bool,
     /// True when the session ended via `:q!` with unsaved changes on the table.
     /// `visudo` and friends rely on a non-zero exit to know the edit was
@@ -329,6 +343,9 @@ impl App {
             tab_width: config.tab_width,
             expand_tabs: config.expand_tabs,
             history_limit: config.history_limit,
+            journal: Journal::discover(),
+            edits_since_journal: 0,
+            pending_recovery: false,
             // The environment wins over the file: it is the thing someone
             // sets for one session, on a box whose config they cannot edit.
             clipboard: std::env::var("MAAT_CLIPBOARD")
@@ -426,6 +443,125 @@ impl App {
     fn after_edit(&mut self) {
         self.cursor.clamp(&self.document.buffer, self.mode);
         self.hash_cache = self.document.buffer_hash();
+        self.edits_since_journal += 1;
+        if self.edits_since_journal >= JOURNAL_EVERY {
+            self.write_journal();
+        }
+    }
+
+    // ── Crash recovery ──────────────────────────────────────────
+
+    /// Mirrors the buffer to the journal, so a crash costs at most the last
+    /// few keystrokes instead of the whole session.
+    ///
+    /// Failures are swallowed on purpose, the same way audit failures are: a
+    /// full disk or a read-only state directory must never cost the user their
+    /// edit, and the editor works exactly as before without a journal.
+    fn write_journal(&mut self) {
+        self.edits_since_journal = 0;
+        let (Some(journal), Some(path)) = (&self.journal, self.document.path()) else {
+            return;
+        };
+        // Nothing to recover once the buffer matches what is on disk — and
+        // leaving a journal there would raise a false alarm on the next open.
+        if !self.is_modified() {
+            journal.remove(path);
+            return;
+        }
+        let _ = journal.write(path, &self.document.to_disk_text(), self.document.disk_hash());
+    }
+
+    /// Points the journal at a scratch directory, so recovery can be tested
+    /// without touching the real state directory.
+    #[cfg(test)]
+    pub fn set_journal_for_test(&mut self, journal: Journal) {
+        self.journal = Some(journal);
+    }
+
+    /// Forces a journal write regardless of the batching counter.
+    #[cfg(test)]
+    pub fn flush_journal_for_test(&mut self) {
+        self.write_journal();
+    }
+
+    /// Drops the journal after the work is safely on disk, or abandoned.
+    fn clear_journal(&mut self) {
+        self.edits_since_journal = 0;
+        if let (Some(journal), Some(path)) = (&self.journal, self.document.path()) {
+            journal.remove(path);
+        }
+    }
+
+    /// Looks for work left behind by a previous session and says so.
+    ///
+    /// Called once, after the document is open. It never restores anything by
+    /// itself: silently replacing the file's contents with a journal is the
+    /// same blind overwrite this editor exists to prevent, so the decision
+    /// stays with the person.
+    pub fn check_for_recovery(&mut self) {
+        let (Some(journal), Some(path)) = (&self.journal, self.document.path()) else {
+            return;
+        };
+        let Some(recovered) = journal.read(path) else { return };
+
+        // Nothing useful: the journal says exactly what the file already says.
+        if recovered.text == self.document.to_disk_text() {
+            journal.remove(path);
+            return;
+        }
+
+        self.pending_recovery = true;
+        let changed_underneath = recovered.opened_hash.as_deref() != self.document.disk_hash();
+        if changed_underneath {
+            self.notify(
+                "recoverable changes found, but the file also changed on disk — \
+                 :recover to load them, :discard to drop them",
+                Level::Error,
+            );
+        } else {
+            self.notify(
+                "unsaved changes from an interrupted session — :recover to load them, \
+                 :discard to drop them",
+                Level::Warn,
+            );
+        }
+    }
+
+    /// `:recover` — load the journal into the buffer.
+    ///
+    /// The file on disk is left alone: recovery puts the work back in front of
+    /// the user as an unsaved buffer, and writing it out is still a `:w` they
+    /// have to type, with the usual integrity check in the way.
+    fn recover(&mut self) {
+        let (Some(journal), Some(path)) = (&self.journal, self.document.path()) else {
+            self.notify("no journal for this buffer", Level::Warn);
+            return;
+        };
+        let Some(recovered) = journal.read(path) else {
+            self.notify("no journal for this buffer", Level::Warn);
+            return;
+        };
+
+        self.checkpoint();
+        self.document.buffer = Buffer::from_text(&recovered.text);
+        self.cursor = Cursor::default();
+        self.pending_recovery = false;
+        self.after_edit();
+        self.notify(
+            "recovered — nothing written yet, :w to save or u to undo the recovery",
+            Level::Info,
+        );
+    }
+
+    /// `:discard` — throw the journal away.
+    fn discard_recovery(&mut self) {
+        if self.journal.is_none() || self.document.path().is_none() {
+            self.notify("no journal for this buffer", Level::Warn);
+            return;
+        }
+        self.clear_journal();
+        self.pending_recovery = false;
+        self.notify("journal discarded", Level::Info);
     }
 
     fn notify(&mut self, text: impl Into<String>, level: Level) {
@@ -1383,6 +1519,8 @@ impl App {
                 self.notify(format!("sha256 {hash}"), Level::Info);
             }
             "check" => self.check_disk(),
+            "recover" => self.recover(),
+            "discard" => self.discard_recovery(),
             "info" => self.show_info(),
             "help" | "h" => self.show_help = true,
             "set relativenumber" | "set rnu" => {
@@ -1533,6 +1671,10 @@ impl App {
         match self.document.save() {
             Ok(()) => {
                 self.hash_cache = self.document.buffer_hash();
+                // The work is on disk: the journal now describes something
+                // already safe, and keeping it would raise a false alarm.
+                self.clear_journal();
+                self.pending_recovery = false;
                 self.emit_audit(hash_before.as_deref());
                 let name = self.document.name();
                 let lines = self.document.buffer.line_count();
@@ -1571,6 +1713,14 @@ impl App {
         // Forcing a quit over unsaved work is what `visudo` needs to see as a
         // non-zero exit: the edit was abandoned, don't install it.
         self.discarded = force && self.is_modified();
+        if self.discarded {
+            // `:q!` over unsaved work is a decision, not a crash. Leaving the
+            // journal would offer back the very changes the user just threw
+            // away, on the next open.
+            self.clear_journal();
+        } else {
+            self.write_journal();
+        }
         self.quit = true;
     }
 
@@ -1891,6 +2041,182 @@ mod tests {
 
         keys(&mut app, "l");
         assert_eq!(app.cursor.col, 1, "one step, not three");
+    }
+
+    // ── Crash recovery ──────────────────────────────────────────
+
+    /// A document backed by a real file, plus a journal in its own scratch
+    /// directory — the two things recovery needs.
+    fn app_with_file(name: &str, contents: &str) -> (App, std::path::PathBuf, Journal) {
+        let dir = std::env::temp_dir().join(format!("maat_recover_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, contents).unwrap();
+
+        let journal = Journal::in_dir(dir.join("state"));
+        let mut app = App::new(Document::open(&file).unwrap());
+        app.set_journal_for_test(journal.clone());
+        (app, file, journal)
+    }
+
+    #[test]
+    fn unsaved_work_reaches_the_journal() {
+        let (mut app, file, journal) = app_with_file("writes", "original");
+
+        press(&mut app, KeyCode::Char('i'));
+        keys(&mut app, "nuevo ");
+        app.flush_journal_for_test();
+
+        let recovered = journal.read(&file).expect("a journal");
+        assert_eq!(recovered.text, "nuevo original");
+        // The file itself is untouched: the journal is a copy, not a save.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "original");
+    }
+
+    #[test]
+    fn saving_clears_the_journal() {
+        let (mut app, file, journal) = app_with_file("cleared", "original");
+
+        press(&mut app, KeyCode::Char('i'));
+        keys(&mut app, "x");
+        app.flush_journal_for_test();
+        assert!(journal.read(&file).is_some());
+
+        press(&mut app, KeyCode::Esc);
+        command(&mut app, "w");
+        assert_eq!(journal.read(&file), None, "the work is on disk now");
+    }
+
+    #[test]
+    fn a_buffer_that_matches_disk_leaves_no_journal() {
+        let (mut app, file, journal) = app_with_file("clean", "original");
+
+        // Type something and undo it: modified, then not.
+        press(&mut app, KeyCode::Char('i'));
+        keys(&mut app, "x");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('u'));
+        app.flush_journal_for_test();
+
+        assert_eq!(journal.read(&file), None);
+    }
+
+    #[test]
+    fn an_interrupted_session_is_announced_on_the_next_open() {
+        let (mut app, file, journal) = app_with_file("announce", "original");
+        press(&mut app, KeyCode::Char('i'));
+        keys(&mut app, "perdido ");
+        app.flush_journal_for_test();
+
+        // A new session over the same file — as if the first had been killed.
+        let mut next = App::new(Document::open(&file).unwrap());
+        next.set_journal_for_test(journal.clone());
+        next.check_for_recovery();
+
+        assert!(next.pending_recovery);
+        assert!(next.message.contains("interrupted session"));
+        assert_eq!(next.level, Level::Warn);
+    }
+
+    #[test]
+    fn recovering_loads_the_work_without_writing_it() {
+        let (mut app, file, journal) = app_with_file("recover", "original");
+        press(&mut app, KeyCode::Char('i'));
+        keys(&mut app, "perdido ");
+        app.flush_journal_for_test();
+
+        let mut next = App::new(Document::open(&file).unwrap());
+        next.set_journal_for_test(journal);
+        next.check_for_recovery();
+        command(&mut next, "recover");
+
+        assert_eq!(next.document.buffer.to_text(), "perdido original");
+        assert!(next.is_modified(), "recovered work is unsaved work");
+        assert!(!next.pending_recovery);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "original",
+            "recovery must not write the file by itself"
+        );
+    }
+
+    #[test]
+    fn a_recovery_can_be_undone() {
+        let (mut app, file, journal) = app_with_file("undo", "original");
+        press(&mut app, KeyCode::Char('i'));
+        keys(&mut app, "perdido ");
+        app.flush_journal_for_test();
+
+        let mut next = App::new(Document::open(&file).unwrap());
+        next.set_journal_for_test(journal);
+        command(&mut next, "recover");
+        press(&mut next, KeyCode::Char('u'));
+
+        assert_eq!(next.document.buffer.to_text(), "original");
+    }
+
+    #[test]
+    fn discarding_throws_the_journal_away() {
+        let (mut app, file, journal) = app_with_file("discard", "original");
+        press(&mut app, KeyCode::Char('i'));
+        keys(&mut app, "x");
+        app.flush_journal_for_test();
+
+        let mut next = App::new(Document::open(&file).unwrap());
+        next.set_journal_for_test(journal.clone());
+        next.check_for_recovery();
+        command(&mut next, "discard");
+
+        assert_eq!(journal.read(&file), None);
+        assert!(!next.pending_recovery);
+    }
+
+    #[test]
+    fn a_file_that_changed_underneath_the_journal_says_so_loudly() {
+        let (mut app, file, journal) = app_with_file("conflict", "original");
+        press(&mut app, KeyCode::Char('i'));
+        keys(&mut app, "mio ");
+        app.flush_journal_for_test();
+
+        // Someone else edited the file while this session was dead.
+        std::fs::write(&file, "de otro").unwrap();
+
+        let mut next = App::new(Document::open(&file).unwrap());
+        next.set_journal_for_test(journal);
+        next.check_for_recovery();
+
+        assert!(next.pending_recovery);
+        assert_eq!(next.level, Level::Error, "louder than an ordinary recovery");
+        assert!(next.message.contains("changed on disk"));
+    }
+
+    #[test]
+    fn quitting_with_q_bang_leaves_nothing_to_recover() {
+        // Discarding is a decision, not a crash: the next open must not offer
+        // back the very changes the user just threw away.
+        let (mut app, file, journal) = app_with_file("quitbang", "original");
+        press(&mut app, KeyCode::Char('i'));
+        keys(&mut app, "x");
+        app.flush_journal_for_test();
+        assert!(journal.read(&file).is_some());
+
+        press(&mut app, KeyCode::Esc);
+        command(&mut app, "q!");
+        assert!(app.quit);
+        assert_eq!(journal.read(&file), None);
+    }
+
+    #[test]
+    fn a_buffer_with_no_path_never_writes_a_journal() {
+        // Nowhere to key it to, and nothing to recover it against.
+        let mut app = app_with("sin ruta");
+        press(&mut app, KeyCode::Char('i'));
+        keys(&mut app, "x");
+        app.flush_journal_for_test();
+        app.check_for_recovery();
+        assert!(!app.pending_recovery);
     }
 
     // ── Configuration ───────────────────────────────────────────

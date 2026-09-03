@@ -154,7 +154,14 @@ whole document after every keystroke.
 
 - Rope or piece table.
 - Incremental syntax highlighting.
-- Recovery journal / swap file.
+- [x] Recovery journal. Unsaved work is mirrored to
+      `$XDG_STATE_HOME/maat/swap` every twenty edits and on a clean quit, and
+      deleted the moment it is on disk — so a journal that outlives its session
+      *means* something. `:recover` loads it back as an unsaved buffer and
+      `:discard` drops it; recovery never writes the file by itself, and it
+      records the disk hash so a file that changed underneath is flagged rather
+      than quietly overwritten. `:q!` clears the journal: discarding is a
+      decision, not a crash.
 - [x] Cross-platform releases: a tag builds six targets (musl x86_64 and
       aarch64 for the appliance, gnu x86_64, both macOS architectures, and
       Windows MSVC) and publishes them with a `SHA256SUMS` file — an editor
