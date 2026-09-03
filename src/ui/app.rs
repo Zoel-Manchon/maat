@@ -30,6 +30,20 @@ struct Snapshot {
     cursor: Cursor,
 }
 
+/// What the register holds, and therefore how `p` puts it back.
+///
+/// Vim's distinction, and it matters: `yy` on one line and `vwy` over a word
+/// both fill the register, but pasting the first opens a new line and pasting
+/// the second drops the text in beside the cursor. Collapsing the two would
+/// make every paste after a visual yank land in the wrong place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Register {
+    /// Whole lines, from `yy` / `dd` / `V`.
+    Lines(Vec<String>),
+    /// A character span, from a character-wise visual yank or delete.
+    Chars(String),
+}
+
 /// A parsed `:s` command.
 ///
 /// Matching is **literal**, not regular-expression based, which is the same
@@ -160,9 +174,10 @@ pub struct App {
     count: Option<usize>,
     /// Where an incremental search started from.
     search_origin: Cursor,
-    /// Line register backing `yy`, `dd`, `p` and `P`. Holds whole lines, so a
-    /// counted `3dd` and its `p` round-trip as the three lines they were.
-    register: Option<Vec<String>>,
+    /// The fixed end of a visual selection; the cursor is the moving end.
+    visual_anchor: Cursor,
+    /// Register backing `yy`, `dd`, `p`, `P` and the visual operators.
+    register: Option<Register>,
     undo_stack: VecDeque<Snapshot>,
     redo_stack: VecDeque<Snapshot>,
     /// Cached SHA-256 of the buffer: recomputing it every frame would be
@@ -194,6 +209,7 @@ impl App {
             pending: None,
             count: None,
             search_origin: Cursor::default(),
+            visual_anchor: Cursor::default(),
             register: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
@@ -342,7 +358,236 @@ impl App {
             Mode::Insert => self.handle_insert(key),
             Mode::Command => self.handle_command(key),
             Mode::Search => self.handle_search(key),
+            Mode::Visual | Mode::VisualLine => self.handle_visual(key),
         }
+    }
+
+    // ── Visual mode ─────────────────────────────────────────────
+
+    /// The selection in document order, as inclusive `(row, col)` bounds.
+    ///
+    /// `None` outside the visual modes, so a caller cannot accidentally act on
+    /// a stale anchor.
+    pub fn selection(&self) -> Option<((usize, usize), (usize, usize))> {
+        if !self.mode.is_visual() {
+            return None;
+        }
+
+        let anchor = (self.visual_anchor.row, self.visual_anchor.col);
+        let head = (self.cursor.row, self.cursor.col);
+        let (start, end) = if anchor <= head { (anchor, head) } else { (head, anchor) };
+
+        match self.mode {
+            // Line-wise ignores the columns entirely: the span is whole lines
+            // from the first column to the last character of the last line.
+            Mode::VisualLine => {
+                let last_col = self.document.buffer.line_len(end.0).saturating_sub(1);
+                Some(((start.0, 0), (end.0, last_col)))
+            }
+            _ => Some((start, end)),
+        }
+    }
+
+    fn enter_visual(&mut self, line_wise: bool) {
+        self.mode = if line_wise { Mode::VisualLine } else { Mode::Visual };
+        self.visual_anchor = self.cursor;
+        self.count = None;
+        self.pending = None;
+        self.message.clear();
+    }
+
+    fn leave_visual(&mut self) {
+        self.mode = Mode::Normal;
+        self.count = None;
+        self.pending = None;
+        self.cursor.clamp(&self.document.buffer, self.mode);
+    }
+
+    /// Copies the selection into the register, tagged with how it was made.
+    fn yank_selection(&mut self) {
+        let Some((start, end)) = self.selection() else { return };
+
+        if self.mode == Mode::VisualLine {
+            let lines: Vec<String> = (start.0..=end.0)
+                .filter_map(|row| self.document.buffer.line(row).map(str::to_string))
+                .collect();
+            let count = lines.len();
+            self.register = Some(Register::Lines(lines));
+            self.notify(count_message(count, "yanked"), Level::Info);
+        } else {
+            let text = self.document.buffer.range_text(start, end);
+            let chars = text.chars().count();
+            self.register = Some(Register::Chars(text));
+            let noun = if chars == 1 { "character" } else { "characters" };
+            self.notify(format!("{chars} {noun} yanked"), Level::Info);
+        }
+
+        // Vim leaves the cursor at the start of what was yanked.
+        self.cursor = Cursor { row: start.0, col: start.1 };
+        self.leave_visual();
+    }
+
+    /// Deletes the selection, yanking it first so `p` can put it back.
+    fn delete_selection(&mut self, then_insert: bool) {
+        let Some((start, end)) = self.selection() else { return };
+        let line_wise = self.mode == Mode::VisualLine;
+
+        self.checkpoint();
+
+        if line_wise {
+            let lines: Vec<String> = (start.0..=end.0)
+                .filter_map(|row| self.document.buffer.line(row).map(str::to_string))
+                .collect();
+            let removed = lines.len();
+            self.register = Some(Register::Lines(lines));
+            self.cursor = Cursor { row: start.0, col: 0 };
+            for _ in 0..removed {
+                self.document.buffer.delete_line(start.0);
+            }
+            // `c` on whole lines leaves an empty one to type into, rather than
+            // dropping the user onto the following line.
+            if then_insert {
+                self.document.buffer.insert_line(start.0, String::new());
+            }
+            self.notify(count_message(removed, "deleted and yanked"), Level::Info);
+        } else {
+            let text = self.document.buffer.range_text(start, end);
+            let chars = text.chars().count();
+            self.register = Some(Register::Chars(text));
+            self.document.buffer.delete_range(start, end);
+            self.cursor = Cursor { row: start.0, col: start.1 };
+            let noun = if chars == 1 { "character" } else { "characters" };
+            self.notify(format!("{chars} {noun} deleted and yanked"), Level::Info);
+        }
+
+        if then_insert {
+            self.mode = Mode::Insert;
+            self.count = None;
+            self.pending = None;
+        } else {
+            self.leave_visual();
+        }
+        self.after_edit();
+    }
+
+    fn handle_visual(&mut self, key: KeyEvent) {
+        // Counts work here too: `3j` extends the selection three lines.
+        if let KeyCode::Char(digit @ '0'..='9') = key.code {
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && (digit != '0' || self.count.is_some())
+            {
+                let value = digit as usize - '0' as usize;
+                self.count = Some(
+                    self.count
+                        .unwrap_or(0)
+                        .saturating_mul(10)
+                        .saturating_add(value)
+                        .min(1_000_000),
+                );
+                return;
+            }
+        }
+
+        if let Some('g') = self.pending.take() {
+            if key.code == KeyCode::Char('g') {
+                self.count = None;
+                self.cursor.buffer_start();
+                return;
+            }
+        }
+
+        let key_had_count = self.count.is_some();
+        let count = self.take_count();
+
+        match key.code {
+            KeyCode::Esc => self.leave_visual(),
+
+            // Motions move the head; the anchor stays put.
+            KeyCode::Char('h') | KeyCode::Left => self.repeat(count, |app| app.cursor.left()),
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.repeat(count, |app| app.cursor.right(&app.document.buffer, app.mode))
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.repeat(count, |app| app.cursor.up(&app.document.buffer, app.mode))
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.repeat(count, |app| app.cursor.down(&app.document.buffer, app.mode))
+            }
+            KeyCode::Char('0') | KeyCode::Home => self.cursor.line_start(),
+            KeyCode::Char('$') | KeyCode::End => self.cursor.line_end(&self.document.buffer, self.mode),
+            KeyCode::Char('G') => match key_had_count {
+                true => self.goto_line(count),
+                false => self.cursor.buffer_end(&self.document.buffer, self.mode),
+            },
+            KeyCode::Char('g') => self.pending = Some('g'),
+            KeyCode::Char('w') => self.repeat(count, |app| app.word_forward()),
+            KeyCode::Char('b') => self.repeat(count, |app| app.word_back()),
+
+            // Switching between the two visual flavours without losing the
+            // anchor, and toggling back out by pressing the same key again.
+            KeyCode::Char('v') => {
+                if self.mode == Mode::Visual {
+                    self.leave_visual();
+                } else {
+                    self.mode = Mode::Visual;
+                }
+            }
+            KeyCode::Char('V') => {
+                if self.mode == Mode::VisualLine {
+                    self.leave_visual();
+                } else {
+                    self.mode = Mode::VisualLine;
+                }
+            }
+            // `o` jumps to the other end, so a selection started in the wrong
+            // direction can be fixed without starting over.
+            KeyCode::Char('o') => std::mem::swap(&mut self.cursor, &mut self.visual_anchor),
+
+            // Operators
+            KeyCode::Char('y') => self.yank_selection(),
+            KeyCode::Char('d') | KeyCode::Char('x') => self.delete_selection(false),
+            KeyCode::Char('c') | KeyCode::Char('s') => self.delete_selection(true),
+            KeyCode::Char('p') => self.replace_selection_with_register(),
+
+            _ => {}
+        }
+    }
+
+    /// `p` over a selection: replace what is highlighted with the register.
+    fn replace_selection_with_register(&mut self) {
+        if self.register.is_none() {
+            self.notify("register empty — use yy or dd first", Level::Warn);
+            return;
+        }
+        let register = self.register.clone();
+        self.delete_selection(false);
+        // delete_selection overwrote the register with what it removed, which
+        // is right for `d` and wrong here: the user asked to paste what they
+        // had, not what they just deleted.
+        let removed = std::mem::replace(&mut self.register, register);
+        match self.register.clone() {
+            Some(Register::Chars(text)) => {
+                self.checkpoint();
+                let landed = self
+                    .document
+                    .buffer
+                    .insert_text(self.cursor.row, self.cursor.col, &text);
+                self.cursor = Cursor { row: landed.0, col: landed.1 };
+                self.after_edit();
+            }
+            Some(Register::Lines(lines)) => {
+                self.checkpoint();
+                for (index, line) in lines.iter().enumerate() {
+                    self.document.buffer.insert_line(self.cursor.row + index, line.clone());
+                }
+                self.cursor.col = 0;
+                self.after_edit();
+            }
+            None => {}
+        }
+        // What was replaced becomes the register, exactly as Vim does it.
+        self.register = removed;
+        self.notify("selection replaced", Level::Info);
     }
 
     /// The count typed before the current command, or 1.
@@ -483,6 +728,10 @@ impl App {
             }
             KeyCode::Char('p') => self.paste_line(false, count),
             KeyCode::Char('P') => self.paste_line(true, count),
+
+            // Selection
+            KeyCode::Char('v') => self.enter_visual(false),
+            KeyCode::Char('V') => self.enter_visual(true),
             KeyCode::Char('u') => self.undo(),
 
             // Search and help
@@ -721,7 +970,7 @@ impl App {
 
         self.checkpoint();
         let removed = lines.len();
-        self.register = Some(lines);
+        self.register = Some(Register::Lines(lines));
         for _ in 0..removed {
             self.document.buffer.delete_line(self.cursor.row);
         }
@@ -737,30 +986,51 @@ impl App {
         }
 
         let yanked = lines.len();
-        self.register = Some(lines);
+        self.register = Some(Register::Lines(lines));
         self.notify(count_message(yanked, "yanked"), Level::Info);
     }
 
+    /// `p` / `P` in Normal mode. Line registers open new lines; character
+    /// registers land beside the cursor, which is where the text came from.
     fn paste_line(&mut self, above: bool, count: usize) {
-        let Some(lines) = self.register.clone() else {
+        let Some(register) = self.register.clone() else {
             self.notify("register empty — use yy or dd first", Level::Warn);
             return;
         };
 
         self.checkpoint();
-        let start = if above { self.cursor.row } else { self.cursor.row + 1 };
-        let mut row = start;
-        for _ in 0..count {
-            for line in &lines {
-                self.document.buffer.insert_line(row, line.clone());
-                row += 1;
+
+        match register {
+            Register::Lines(lines) => {
+                let start = if above { self.cursor.row } else { self.cursor.row + 1 };
+                let mut row = start;
+                for _ in 0..count {
+                    for line in &lines {
+                        self.document.buffer.insert_line(row, line.clone());
+                        row += 1;
+                    }
+                }
+                self.cursor.row = start;
+                self.cursor.col = 0;
+                self.after_edit();
+                self.notify(count_message(lines.len() * count, "pasted"), Level::Info);
+            }
+            Register::Chars(text) => {
+                // `p` puts after the cursor, `P` before it — the difference
+                // that makes pasting a word inside a line land where expected.
+                let col = if above { self.cursor.col } else { self.cursor.col + 1 };
+                let mut landed = (self.cursor.row, col);
+                for _ in 0..count {
+                    landed = self.document.buffer.insert_text(landed.0, landed.1, &text);
+                    landed.1 += 1;
+                }
+                self.cursor = Cursor { row: landed.0, col: landed.1.saturating_sub(1) };
+                self.after_edit();
+                let chars = text.chars().count() * count;
+                let noun = if chars == 1 { "character" } else { "characters" };
+                self.notify(format!("{chars} {noun} pasted"), Level::Info);
             }
         }
-
-        self.cursor.row = start;
-        self.cursor.col = 0;
-        self.after_edit();
-        self.notify(count_message(lines.len() * count, "pasted"), Level::Info);
     }
 
     // ── Commands ────────────────────────────────────────────────
@@ -1268,6 +1538,182 @@ mod tests {
 
         keys(&mut app, "l");
         assert_eq!(app.cursor.col, 1, "one step, not three");
+    }
+
+    // ── Visual mode ─────────────────────────────────────────────
+
+    #[test]
+    fn v_starts_a_selection_and_esc_ends_it() {
+        let mut app = app_with("hello");
+        keys(&mut app, "v");
+        assert_eq!(app.mode, Mode::Visual);
+        assert_eq!(app.selection(), Some(((0, 0), (0, 0))), "one character to start");
+
+        keys(&mut app, "ll");
+        assert_eq!(app.selection(), Some(((0, 0), (0, 2))));
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.selection(), None);
+    }
+
+    #[test]
+    fn a_selection_made_backwards_still_reads_forwards() {
+        let mut app = app_with("hello");
+        keys(&mut app, "lll"); // on the second 'l'
+        keys(&mut app, "vhh"); // select leftwards
+        assert_eq!(app.selection(), Some(((0, 1), (0, 3))));
+    }
+
+    #[test]
+    fn visual_delete_removes_exactly_what_was_highlighted() {
+        let mut app = app_with("hello world");
+        keys(&mut app, "vllll"); // "hello"
+        keys(&mut app, "d");
+
+        assert_eq!(app.document.buffer.line(0), Some(" world"));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.message, "5 characters deleted and yanked");
+    }
+
+    #[test]
+    fn visual_yank_then_paste_puts_the_span_beside_the_cursor() {
+        let mut app = app_with("abc");
+        keys(&mut app, "vly"); // yank "ab"
+        assert_eq!(app.cursor.col, 0, "the cursor returns to the start of the yank");
+
+        keys(&mut app, "$"); // on 'c'
+        keys(&mut app, "p");
+        assert_eq!(app.document.buffer.line(0), Some("abcab"));
+    }
+
+    #[test]
+    fn a_character_yank_pastes_inside_the_line_not_as_a_new_one() {
+        let mut app = app_with("xy\nsecond");
+        keys(&mut app, "vy"); // one character: "x"
+        keys(&mut app, "p");
+
+        assert_eq!(app.document.buffer.line_count(), 2, "no new line was opened");
+        assert_eq!(app.document.buffer.line(0), Some("xxy"));
+    }
+
+    #[test]
+    fn visual_selection_spans_lines() {
+        let mut app = app_with("uno\ndos\ntres");
+        keys(&mut app, "lvj"); // from (0,1) to (1,1)
+        assert_eq!(app.selection(), Some(((0, 1), (1, 1))));
+
+        keys(&mut app, "d");
+        assert_eq!(app.document.buffer.to_text(), "us\ntres");
+    }
+
+    #[test]
+    fn capital_v_selects_whole_lines_whatever_the_columns() {
+        let mut app = app_with("uno\ndos largo\ntres");
+        keys(&mut app, "llV"); // column 2, line-wise
+        assert_eq!(app.selection(), Some(((0, 0), (0, 2))), "the whole first line");
+
+        keys(&mut app, "j");
+        assert_eq!(
+            app.selection(),
+            Some(((0, 0), (1, 8))),
+            "both lines, to the end of the longer one"
+        );
+    }
+
+    #[test]
+    fn line_wise_delete_takes_whole_lines_and_yanks_them_as_lines() {
+        let mut app = app_with("uno\ndos\ntres");
+        keys(&mut app, "Vj");
+        keys(&mut app, "d");
+        assert_eq!(app.document.buffer.to_text(), "tres");
+        assert_eq!(app.message, "2 lines deleted and yanked");
+
+        // A line register opens new lines when pasted, unlike a character one.
+        keys(&mut app, "p");
+        assert_eq!(app.document.buffer.to_text(), "tres\nuno\ndos");
+    }
+
+    #[test]
+    fn c_over_a_selection_deletes_it_and_drops_into_insert() {
+        let mut app = app_with("hello world");
+        keys(&mut app, "vllll"); // "hello"
+        keys(&mut app, "c");
+
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.document.buffer.line(0), Some(" world"));
+
+        keys(&mut app, "adios");
+        assert_eq!(app.document.buffer.line(0), Some("adios world"));
+    }
+
+    #[test]
+    fn line_wise_change_leaves_an_empty_line_to_type_into() {
+        let mut app = app_with("uno\ndos");
+        keys(&mut app, "Vc");
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.document.buffer.to_text(), "\ndos");
+    }
+
+    #[test]
+    fn o_swaps_the_ends_of_a_selection() {
+        let mut app = app_with("abcdef");
+        keys(&mut app, "vll"); // anchor 0, head 2
+        keys(&mut app, "o");
+        assert_eq!(app.cursor.col, 0);
+        assert_eq!(app.visual_anchor.col, 2);
+
+        // Extending now grows the *other* end.
+        keys(&mut app, "h");
+        assert_eq!(app.selection(), Some(((0, 0), (0, 2))));
+    }
+
+    #[test]
+    fn v_and_capital_v_toggle_and_switch_without_losing_the_anchor() {
+        let mut app = app_with("abcdef\nghijkl");
+        keys(&mut app, "vll");
+        keys(&mut app, "V");
+        assert_eq!(app.mode, Mode::VisualLine);
+        assert_eq!(app.selection(), Some(((0, 0), (0, 5))), "same line, now whole");
+
+        keys(&mut app, "v");
+        assert_eq!(app.mode, Mode::Visual);
+        assert_eq!(app.selection(), Some(((0, 0), (0, 2))), "the anchor survived");
+
+        keys(&mut app, "v");
+        assert_eq!(app.mode, Mode::Normal, "pressing v again leaves visual mode");
+    }
+
+    #[test]
+    fn a_count_extends_the_selection() {
+        let mut app = app_with("a\nb\nc\nd\ne");
+        keys(&mut app, "v3j");
+        assert_eq!(app.selection(), Some(((0, 0), (3, 0))));
+    }
+
+    #[test]
+    fn a_visual_delete_is_one_undo_step() {
+        let mut app = app_with("hello world");
+        keys(&mut app, "vllll");
+        keys(&mut app, "d");
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.document.buffer.line(0), Some("hello world"));
+    }
+
+    #[test]
+    fn p_over_a_selection_swaps_it_for_the_register() {
+        let mut app = app_with("uno\ndos");
+        keys(&mut app, "yy"); // register: the line "uno"
+        keys(&mut app, "jVp"); // replace the second line with it
+        assert_eq!(app.document.buffer.to_text(), "uno\nuno");
+    }
+
+    #[test]
+    fn visual_operators_respect_multibyte_text() {
+        let mut app = app_with("café con leche");
+        keys(&mut app, "vlll"); // "café"
+        keys(&mut app, "d");
+        assert_eq!(app.document.buffer.line(0), Some(" con leche"));
     }
 
     // ── Bracketed paste ─────────────────────────────────────────

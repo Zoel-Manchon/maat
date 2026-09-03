@@ -117,6 +117,79 @@ impl Buffer {
     pub fn iter_lines(&self) -> impl Iterator<Item = &str> {
         self.lines.iter().map(String::as_str)
     }
+
+    /// The text of an **inclusive** character range, `(row, col)` to
+    /// `(row, col)`.
+    ///
+    /// Inclusive because that is what a visual selection means: the character
+    /// under the cursor is part of it, which is the difference between `d`
+    /// deleting what you highlighted and deleting one character less.
+    pub fn range_text(&self, start: (usize, usize), end: (usize, usize)) -> String {
+        let (start, end) = order(start, end);
+        if start.0 >= self.lines.len() {
+            return String::new();
+        }
+        let last_row = end.0.min(self.lines.len().saturating_sub(1));
+
+        if start.0 == last_row {
+            let line = &self.lines[start.0];
+            return slice_chars(line, start.1, end.1.saturating_add(1));
+        }
+
+        let mut out = slice_chars(&self.lines[start.0], start.1, usize::MAX);
+        for row in (start.0 + 1)..last_row {
+            out.push('\n');
+            out.push_str(&self.lines[row]);
+        }
+        out.push('\n');
+        out.push_str(&slice_chars(&self.lines[last_row], 0, end.1.saturating_add(1)));
+        out
+    }
+
+    /// Removes an **inclusive** character range, joining what is left of the
+    /// first and last lines. Returns `true` if anything was removed.
+    pub fn delete_range(&mut self, start: (usize, usize), end: (usize, usize)) -> bool {
+        let (start, end) = order(start, end);
+        if start.0 >= self.lines.len() {
+            return false;
+        }
+        let last_row = end.0.min(self.lines.len().saturating_sub(1));
+
+        if start.0 == last_row {
+            let line = &self.lines[start.0];
+            let head = slice_chars(line, 0, start.1);
+            let tail = slice_chars(line, end.1.saturating_add(1), usize::MAX);
+            self.lines[start.0] = head + &tail;
+            return true;
+        }
+
+        let head = slice_chars(&self.lines[start.0], 0, start.1);
+        let tail = slice_chars(&self.lines[last_row], end.1.saturating_add(1), usize::MAX);
+        self.lines.drain(start.0..=last_row);
+        self.lines.insert(start.0, head + &tail);
+        true
+    }
+
+    /// Inserts text at a character position, splitting the line on newlines.
+    /// Returns where the cursor should land: the last character written.
+    pub fn insert_text(&mut self, row: usize, col: usize, text: &str) -> (usize, usize) {
+        if row >= self.lines.len() || text.is_empty() {
+            return (row, col);
+        }
+
+        let mut cursor = (row, col);
+        for (index, chunk) in text.split('\n').enumerate() {
+            if index > 0 {
+                self.insert_newline(cursor.0, cursor.1);
+                cursor = (cursor.0 + 1, 0);
+            }
+            for ch in chunk.chars() {
+                self.insert_char(cursor.0, cursor.1, ch);
+                cursor.1 += 1;
+            }
+        }
+        (cursor.0, cursor.1.saturating_sub(1))
+    }
 }
 
 /// Translates a character index into a byte offset within the line.
@@ -126,6 +199,20 @@ fn char_to_byte(line: &str, col: usize) -> usize {
     line.char_indices()
         .nth(col)
         .map_or(line.len(), |(byte, _)| byte)
+}
+
+/// `[from, to)` in characters, clamped at both ends. Character indices again,
+/// not bytes: slicing `café` by byte is how an editor corrupts a file.
+fn slice_chars(line: &str, from: usize, to: usize) -> String {
+    let start = char_to_byte(line, from);
+    let end = char_to_byte(line, to.max(from));
+    line[start..end.max(start)].to_string()
+}
+
+/// Puts two positions in document order, so callers never have to care which
+/// end of a selection the user started from.
+fn order(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+    if (a.0, a.1) <= (b.0, b.1) { (a, b) } else { (b, a) }
 }
 
 #[cfg(test)]
@@ -190,6 +277,71 @@ mod tests {
         assert!(buffer.replace_line(1, "DOS".into()));
         assert_eq!(buffer.to_text(), "uno\nDOS");
         assert!(!buffer.replace_line(9, "nada".into()));
+    }
+
+    // ── Character ranges ────────────────────────────────────────
+
+    #[test]
+    fn reads_a_range_inside_one_line() {
+        let buffer = Buffer::from_text("hello world");
+        assert_eq!(buffer.range_text((0, 0), (0, 4)), "hello");
+        assert_eq!(buffer.range_text((0, 6), (0, 10)), "world");
+    }
+
+    #[test]
+    fn a_range_reads_the_same_backwards() {
+        // The user may have selected right-to-left; the range is the range.
+        let buffer = Buffer::from_text("hello");
+        assert_eq!(buffer.range_text((0, 4), (0, 1)), buffer.range_text((0, 1), (0, 4)));
+    }
+
+    #[test]
+    fn reads_a_range_across_lines() {
+        let buffer = Buffer::from_text("uno\ndos\ntres");
+        // Inclusive at both ends: "uno" from 1, all of "dos", "tres" up to and
+        // including index 1.
+        assert_eq!(buffer.range_text((0, 1), (2, 1)), "no\ndos\ntr");
+    }
+
+    #[test]
+    fn a_range_is_inclusive_of_the_character_under_the_cursor() {
+        let buffer = Buffer::from_text("abc");
+        assert_eq!(buffer.range_text((0, 1), (0, 1)), "b");
+    }
+
+    #[test]
+    fn deletes_a_range_inside_one_line() {
+        let mut buffer = Buffer::from_text("hello world");
+        assert!(buffer.delete_range((0, 5), (0, 10)));
+        assert_eq!(buffer.line(0), Some("hello"));
+    }
+
+    #[test]
+    fn deleting_across_lines_joins_what_is_left() {
+        let mut buffer = Buffer::from_text("uno\ndos\ntres");
+        assert!(buffer.delete_range((0, 1), (2, 1)));
+        assert_eq!(buffer.to_text(), "ues");
+        assert_eq!(buffer.line_count(), 1);
+    }
+
+    #[test]
+    fn range_operations_respect_multibyte_characters() {
+        let buffer = Buffer::from_text("café con leche");
+        assert_eq!(buffer.range_text((0, 0), (0, 3)), "café");
+
+        // Characters 4..=7 are " con" — the é before them is one character and
+        // two bytes, which is exactly what a byte-indexed slice would get wrong.
+        let mut buffer = Buffer::from_text("café con leche");
+        assert!(buffer.delete_range((0, 4), (0, 7)));
+        assert_eq!(buffer.line(0), Some("café leche"));
+    }
+
+    #[test]
+    fn inserts_text_with_newlines_at_a_position() {
+        let mut buffer = Buffer::from_text("ad");
+        let landed = buffer.insert_text(0, 1, "b\nc");
+        assert_eq!(buffer.to_text(), "ab\ncd");
+        assert_eq!(landed, (1, 0));
     }
 
     #[test]

@@ -114,8 +114,22 @@ fn draw_buffer(frame: &mut Frame, area: Rect, app: &App, gutter: u16) {
             .collect();
         let content_len = content.chars().count();
 
+        // Where the visual selection falls on this row, in the coordinates of
+        // the slice actually on screen.
+        let selection = app.selection().and_then(|(start, end)| {
+            if row < start.0 || row > end.0 {
+                return None;
+            }
+            let line_len = app.document.buffer.line_len(row);
+            let from = if row == start.0 { start.1 } else { 0 };
+            let to = if row == end.0 { end.1.saturating_add(1).min(line_len) } else { line_len };
+            let from = from.saturating_sub(app.offset_col).min(width);
+            let to = to.saturating_sub(app.offset_col).min(width);
+            (to > from).then_some((from, to))
+        });
+
         let mut spans = vec![Span::styled(number, number_style)];
-        spans.extend(highlight_matches(content, query, content_style));
+        spans.extend(highlight_line(content, query, content_style, selection));
         spans.push(Span::styled(
             " ".repeat(width.saturating_sub(content_len)),
             content_style,
@@ -124,6 +138,35 @@ fn draw_buffer(frame: &mut Frame, area: Rect, app: &App, gutter: u16) {
     }
 
     frame.render_widget(Paragraph::new(lines).style(theme::text()), area);
+}
+
+/// One rendered line: the visual selection wins over search highlighting where
+/// the two overlap, because the selection is what the next keystroke acts on.
+/// `selection` is a `[from, to)` character range within `text`.
+fn highlight_line(
+    text: String,
+    query: &str,
+    base: Style,
+    selection: Option<(usize, usize)>,
+) -> Vec<Span<'static>> {
+    let Some((from, to)) = selection else {
+        return highlight_matches(text, query, base);
+    };
+
+    let chars: Vec<char> = text.chars().collect();
+    let from = from.min(chars.len());
+    let to = to.min(chars.len()).max(from);
+
+    let head: String = chars[..from].iter().collect();
+    let selected: String = chars[from..to].iter().collect();
+    let tail: String = chars[to..].iter().collect();
+
+    let mut spans = highlight_matches(head, query, base);
+    if !selected.is_empty() {
+        spans.push(Span::styled(selected, theme::selection()));
+    }
+    spans.extend(highlight_matches(tail, query, base));
+    spans
 }
 
 fn highlight_matches(text: String, query: &str, base: Style) -> Vec<Span<'static>> {
@@ -250,6 +293,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Insert => theme::mode_tag_insert(),
         Mode::Command => theme::mode_tag_command(),
         Mode::Search => theme::mode_tag_search(),
+        Mode::Visual | Mode::VisualLine => theme::mode_tag_visual(),
     };
     let tag = format!(" {} ", app.mode.label());
 
@@ -323,11 +367,13 @@ fn draw_message(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// The key guide, as section/keys pairs. An empty section opens a free line.
-const HELP_ROWS: [(&str, &str); 11] = [
+const HELP_ROWS: [(&str, &str); 13] = [
     ("MOVEMENT", "h j k l · w b · 0 $ · gg G · 12G"),
     ("COUNTS", "3j · 5x · 2dd · 3p — before any of the above"),
     ("INSERT", "i a I A · o O · Esc"),
     ("EDIT", "x · dd · yy · p P · u · Ctrl-r"),
+    ("VISUAL", "v char · V line · o other end · Esc"),
+    ("V-OPS", "d delete · y yank · c change · p replace"),
     ("SEARCH", "/text · n next · N previous"),
     ("REPLACE", ":s/old/new/ · :s/old/new/g · :%s/old/new/g"),
     ("FILES", ":w · :w <path> · :w! · :q · :q! · :wq"),

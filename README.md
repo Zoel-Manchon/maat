@@ -37,11 +37,16 @@ stop being.
 
 ## Highlights
 
-- Normal, Insert, Command and Search modes.
-- Vim-inspired motions: `hjkl`, `w`, `b`, `0`, `$`, `gg`, `G`.
+- Normal, Insert, Command, Search and Visual modes.
+- Vim-inspired motions: `hjkl`, `w`, `b`, `0`, `$`, `gg`, `G`, `12G`.
+- Counts before any motion or operator: `3j`, `5x`, `2dd`, `3p`.
+- Visual selection: `v` character-wise, `V` line-wise, with `d`, `y`, `c`, `p`.
+- Literal substitution: `:s/old/new/`, `/g`, and `:%s` for the whole file.
 - Incremental `/search`, highlighted matches and `n` / `N` navigation.
 - Undo with `u` and redo with `Ctrl-r`.
-- Line register: `yy`, `dd`, `p` and `P`.
+- Register that remembers whether it holds lines or a character span.
+- CRLF and LF line endings preserved exactly as the file had them.
+- Bracketed paste: a pasted block is inserted as text, never run as commands.
 - External-change detection before save; explicit `:w!` override.
 - Live SHA-256 fingerprint and `:check` integrity command.
 - Integrated `?` help panel and a branded welcome screen.
@@ -104,6 +109,22 @@ The destination directory must already exist.
 | `n` / `N` | Next / previous result |
 | `?` | Toggle quick reference |
 | `:` | Enter Command mode |
+| `v` / `V` | Visual mode, character-wise / line-wise |
+| `3j` `5x` `2dd` | A count applies to any motion or operator |
+| `12G` | Jump to line 12 |
+
+### Visual mode
+
+| Keys | Action |
+|---|---|
+| `v` / `V` | Start a character-wise / line-wise selection |
+| motions | Extend the selection; counts work here too |
+| `o` | Jump to the other end of the selection |
+| `d` / `x` | Delete the selection (and yank it) |
+| `y` | Yank the selection |
+| `c` | Delete the selection and enter Insert mode |
+| `p` | Replace the selection with the register |
+| `Esc` | Leave without touching anything |
 
 ### Commands
 
@@ -114,6 +135,9 @@ The destination directory must already exist.
 | `:w!` | Force save after an integrity warning |
 | `:q` / `:q!` | Quit / discard changes |
 | `:wq` / `:x` | Save and quit |
+| `:s/old/new/` | Replace the first match on the current line |
+| `:s/old/new/g` | Replace every match on the current line |
+| `:%s/old/new/g` | Replace every match in the file |
 | `:hash` | Show full buffer SHA-256 |
 | `:check` | Compare the file with the last known disk state |
 | `:info` | Show path, lines, words and characters |
@@ -201,7 +225,7 @@ flowchart TB
     subgraph CORE["core/ — domain, zero UI deps"]
         BUFFER[buffer<br/>UTF-8-safe lines]
         CURSOR[cursor<br/>mode-aware invariants]
-        MODE[mode<br/>Normal · Insert · Command · Search]
+        MODE[mode<br/>Normal · Insert · Command · Search · Visual]
         DOCUMENT[document<br/>atomic I/O · SHA-256 disk state]
         AUDIT[audit<br/>JSON / CEF events]
     end
@@ -229,7 +253,7 @@ src/
 │   ├── audit.rs     structured save events (JSON / CEF)
 │   ├── buffer.rs    UTF-8-safe line buffer
 │   ├── cursor.rs    mode-aware cursor invariants
-│   ├── mode.rs      Normal / Insert / Command / Search
+│   ├── mode.rs      Normal / Insert / Command / Search / Visual
 │   └── document.rs  atomic file I/O and SHA-256 disk-state checks
 └── ui/
     ├── app.rs       editor state, history, search and key handling
@@ -293,7 +317,7 @@ pull requests. Formatting and Clippy remain recommended local pre-commit checks.
 - [x] Counts for motions and operations (`3j`, `12G`, `2dd`, `3p`).
 - [x] CRLF/LF line endings preserved across a save.
 - [x] Bracketed paste, and a terminal that survives a panic.
-- [ ] Visual mode and character-wise operators.
+- [x] Visual mode (`v` / `V`) with character-wise and line-wise operators.
 - [ ] Configurable key map, theme and editor options.
 - [ ] Syntax highlighting with language detection.
 - [ ] Tabs, multiple buffers and a file picker.

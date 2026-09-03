@@ -123,7 +123,10 @@ whole document after every keystroke.
 
 ### 0.4
 
-- Visual mode.
+- [x] Visual mode: `v` character-wise, `V` line-wise, `o` to swap ends, and
+      `d` / `y` / `c` / `p` over the selection. The register now remembers
+      whether it holds lines or a character span, so a visual yank pastes
+      beside the cursor and a `yy` still opens a new line.
 - Composable operators and motions.
 - Optional system clipboard.
 - TOML configuration for theme, tabs and numbers.

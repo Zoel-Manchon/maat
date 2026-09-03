@@ -112,6 +112,23 @@ pub fn mode_tag_search() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+pub fn mode_tag_visual() -> Style {
+    Style::default()
+        .fg(bg())
+        .bg(rose())
+        .add_modifier(Modifier::BOLD)
+}
+
+/// The highlighted span in visual mode. Deliberately not the search style: on
+/// screen it has to be obvious which one you are looking at when a selection
+/// happens to sit on top of a match.
+pub fn selection() -> Style {
+    Style::default()
+        .fg(bg())
+        .bg(rose())
+        .add_modifier(Modifier::BOLD)
+}
+
 pub fn hash() -> Style {
     Style::default().fg(hash_colour()).bg(bg_panel())
 }
