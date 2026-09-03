@@ -11,7 +11,7 @@ keywords = ["terminal", "editor", "vim", "ratatui", "sha256"]
 categories = ["command-line-utilities", "text-editors"]
 
 [dependencies]
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.28"
 sha2 = "0.10"
 
