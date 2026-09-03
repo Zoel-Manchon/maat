@@ -1,7 +1,9 @@
 mod core;
 mod ui;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -99,6 +101,8 @@ fn edit(path: Option<PathBuf>) -> io::Result<ExitCode> {
         None => Document::default(),
     };
 
+    install_panic_hook();
+
     let mut terminal = setup_terminal()?;
     let outcome = run(&mut terminal, App::new(document));
     restore_terminal(&mut terminal)?;
@@ -110,18 +114,41 @@ fn edit(path: Option<PathBuf>) -> io::Result<ExitCode> {
 
 /// Raw mode + alternate screen: the editor takes over the whole terminal and
 /// receives every keystroke before the shell can interpret it.
+///
+/// Bracketed paste is switched on here too, so a pasted block arrives as one
+/// `Event::Paste` instead of being replayed key by key — which in Normal mode
+/// would execute the paste as commands rather than insert it as text.
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
 /// ALWAYS undo it on the way out — otherwise the terminal is left unusable.
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
     terminal.show_cursor()
+}
+
+/// Put the terminal back before a panic is printed.
+///
+/// A panic while in raw mode on the alternate screen leaves the user with a
+/// terminal that echoes nothing and a message they cannot read — and, on the
+/// appliance console this editor is aimed at, no second terminal to recover
+/// from. The hook restores the screen first, then lets the default hook print
+/// exactly what it would have printed.
+///
+/// It writes straight to stdout rather than through the `Terminal`, because by
+/// the time a panic unwinds we cannot assume anything about who owns it.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+        default_hook(info);
+    }));
 }
 
 /// The event loop: draw, wait for a key, apply it, repeat. Returns whether the
@@ -137,6 +164,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> io::R
             // Windows emits both Press and Release for every key; without
             // this filter each keystroke would count twice.
             Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+            // Arrives as one event thanks to bracketed paste: inserted as
+            // text, never interpreted as commands.
+            Event::Paste(text) => app.paste_text(&text),
             Event::Resize(_, _) => {}
             _ => {}
         }

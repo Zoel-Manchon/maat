@@ -30,6 +30,111 @@ struct Snapshot {
     cursor: Cursor,
 }
 
+/// A parsed `:s` command.
+///
+/// Matching is **literal**, not regular-expression based, which is the same
+/// contract `/` already has. That is a deliberate limit rather than a missing
+/// feature: the files this editor is aimed at — an appliance's sshd_config, a
+/// sudoers file, a unit file — are edited under pressure, and a pattern that
+/// quietly means something other than what it looks like is the last thing
+/// that situation needs. What you type is what gets replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Substitution {
+    pattern: String,
+    replacement: String,
+    /// `g`: every occurrence on a line, not just the first.
+    global: bool,
+    /// `%`: every line, not just the one under the cursor.
+    whole_file: bool,
+}
+
+/// Parses `[%]s/pattern/replacement[/flags]`.
+///
+/// The character right after `s` is the delimiter, so `:s#/usr/bin#/bin#`
+/// works without escaping every slash in a path — which is most of what one
+/// substitutes in a config file. Inside the fields, the delimiter can still be
+/// escaped with a backslash.
+fn parse_substitution(command: &str) -> Option<Substitution> {
+    let (whole_file, rest) = match command.strip_prefix('%') {
+        Some(rest) => (true, rest),
+        None => (false, command),
+    };
+
+    let rest = rest.strip_prefix('s')?;
+    let mut chars = rest.chars();
+    let delimiter = chars.next()?;
+    if delimiter.is_alphanumeric() || delimiter.is_whitespace() {
+        return None;
+    }
+
+    let mut fields: Vec<String> = vec![String::new()];
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            // A backslash only escapes the delimiter; anywhere else it stays a
+            // literal backslash, because these files are full of them.
+            if ch != delimiter {
+                fields.last_mut()?.push('\\');
+            }
+            fields.last_mut()?.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == delimiter {
+            fields.push(String::new());
+        } else {
+            fields.last_mut()?.push(ch);
+        }
+    }
+    if escaped {
+        fields.last_mut()?.push('\\');
+    }
+
+    let pattern = fields.first()?.clone();
+    if pattern.is_empty() {
+        return None;
+    }
+    let replacement = fields.get(1).cloned().unwrap_or_default();
+    let flags = fields.get(2).map(String::as_str).unwrap_or("");
+    if flags.chars().any(|flag| flag != 'g') {
+        return None;
+    }
+
+    Some(Substitution {
+        pattern,
+        replacement,
+        global: flags.contains('g'),
+        whole_file,
+    })
+}
+
+/// "1 line yanked" / "3 lines yanked" — singular and plural, so the status bar
+/// never reads like a placeholder.
+fn count_message(lines: usize, what: &str) -> String {
+    let noun = if lines == 1 { "line" } else { "lines" };
+    format!("{lines} {noun} {what}")
+}
+
+/// Applies a substitution to one line, returning the new line and how many
+/// occurrences were replaced.
+fn substitute_line(line: &str, rule: &Substitution) -> (String, usize) {
+    if rule.global {
+        let count = line.matches(&rule.pattern).count();
+        (line.replace(&rule.pattern, &rule.replacement), count)
+    } else {
+        match line.find(&rule.pattern) {
+            Some(at) => {
+                let mut out = String::with_capacity(line.len());
+                out.push_str(&line[..at]);
+                out.push_str(&rule.replacement);
+                out.push_str(&line[at + rule.pattern.len()..]);
+                (out, 1)
+            }
+            None => (line.to_string(), 0),
+        }
+    }
+}
+
 pub struct App {
     pub document: Document,
     pub cursor: Cursor,
@@ -50,10 +155,14 @@ pub struct App {
     pub relative_numbers: bool,
     /// Pending key of a two-stroke command (`gg`, `dd`, `yy`).
     pending: Option<char>,
+    /// Digits typed before a command: the `3` in `3dd`. `None` until the first
+    /// digit, which is what lets `0` keep meaning "start of line".
+    count: Option<usize>,
     /// Where an incremental search started from.
     search_origin: Cursor,
-    /// Simple line register backing `yy`, `dd`, `p` and `P`.
-    register: Option<String>,
+    /// Line register backing `yy`, `dd`, `p` and `P`. Holds whole lines, so a
+    /// counted `3dd` and its `p` round-trip as the three lines they were.
+    register: Option<Vec<String>>,
     undo_stack: VecDeque<Snapshot>,
     redo_stack: VecDeque<Snapshot>,
     /// Cached SHA-256 of the buffer: recomputing it every frame would be
@@ -83,6 +192,7 @@ impl App {
             show_help: false,
             relative_numbers: false,
             pending: None,
+            count: None,
             search_origin: Cursor::default(),
             register: None,
             undo_stack: VecDeque::new(),
@@ -235,32 +345,63 @@ impl App {
         }
     }
 
+    /// The count typed before the current command, or 1.
+    ///
+    /// Reading it clears it: a count belongs to exactly one command, and
+    /// leaking it into the next keystroke is how `2j` quietly becomes `2x`.
+    fn take_count(&mut self) -> usize {
+        self.count.take().unwrap_or(1).max(1)
+    }
+
+    /// The digits typed so far, for the status bar to echo back.
+    pub fn pending_count(&self) -> Option<usize> {
+        self.count
+    }
+
     fn handle_normal(&mut self, key: KeyEvent) {
+        // Digits build a count — except a leading `0`, which is the motion to
+        // the start of the line. Once a count is under way, `0` is just a
+        // digit, so `10j` means ten lines down and not "line start, then j".
+        if let KeyCode::Char(digit @ '0'..='9') = key.code {
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && (digit != '0' || self.count.is_some())
+            {
+                let value = digit as usize - '0' as usize;
+                // Saturating: a user leaning on a digit key must not overflow
+                // into a panic or a wrapped-around tiny count.
+                self.count = Some(
+                    self.count
+                        .unwrap_or(0)
+                        .saturating_mul(10)
+                        .saturating_add(value)
+                        .min(1_000_000),
+                );
+                return;
+            }
+        }
+
         // Two-stroke commands: if one is pending, this key completes it.
         if let Some(first) = self.pending.take() {
             match (first, key.code) {
                 ('g', KeyCode::Char('g')) => {
+                    self.count = None;
                     self.cursor.buffer_start();
                     return;
                 }
                 ('d', KeyCode::Char('d')) => {
-                    if let Some(line) = self.document.buffer.line(self.cursor.row) {
-                        self.register = Some(line.to_string());
-                        self.checkpoint();
-                        self.document.buffer.delete_line(self.cursor.row);
-                        self.after_edit();
-                        self.notify("line deleted and yanked", Level::Info);
-                    }
+                    let count = self.take_count();
+                    self.delete_lines(count);
                     return;
                 }
                 ('y', KeyCode::Char('y')) => {
-                    if let Some(line) = self.document.buffer.line(self.cursor.row) {
-                        self.register = Some(line.to_string());
-                        self.notify("line yanked", Level::Info);
-                    }
+                    let count = self.take_count();
+                    self.yank_lines(count);
                     return;
                 }
-                _ => {} // sequence aborted: this key is processed as a normal one
+                _ => {
+                    // Sequence aborted: this key is processed as a normal one,
+                    // and the count it may have carried goes with it.
+                }
             }
         }
 
@@ -269,18 +410,34 @@ impl App {
             return;
         }
 
+        // Captured before the count is consumed: `G` and `12G` are different
+        // commands, and only the presence of digits tells them apart.
+        let key_had_count = self.count.is_some();
+        let count = self.take_count();
+
         match key.code {
             // Motion
-            KeyCode::Char('h') | KeyCode::Left => self.cursor.left(),
-            KeyCode::Char('l') | KeyCode::Right => self.cursor.right(&self.document.buffer, self.mode),
-            KeyCode::Char('k') | KeyCode::Up => self.cursor.up(&self.document.buffer, self.mode),
-            KeyCode::Char('j') | KeyCode::Down => self.cursor.down(&self.document.buffer, self.mode),
+            KeyCode::Char('h') | KeyCode::Left => self.repeat(count, |app| app.cursor.left()),
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.repeat(count, |app| app.cursor.right(&app.document.buffer, app.mode))
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.repeat(count, |app| app.cursor.up(&app.document.buffer, app.mode))
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.repeat(count, |app| app.cursor.down(&app.document.buffer, app.mode))
+            }
             KeyCode::Char('0') | KeyCode::Home => self.cursor.line_start(),
             KeyCode::Char('$') | KeyCode::End => self.cursor.line_end(&self.document.buffer, self.mode),
-            KeyCode::Char('G') => self.cursor.buffer_end(&self.document.buffer, self.mode),
+            // Bare `G` goes to the last line; `12G` goes to line 12, counting
+            // from one the way the line numbers on screen do.
+            KeyCode::Char('G') => match key_had_count {
+                true => self.goto_line(count),
+                false => self.cursor.buffer_end(&self.document.buffer, self.mode),
+            },
             KeyCode::Char('g') => self.pending = Some('g'),
-            KeyCode::Char('w') => self.word_forward(),
-            KeyCode::Char('b') => self.word_back(),
+            KeyCode::Char('w') => self.repeat(count, |app| app.word_forward()),
+            KeyCode::Char('b') => self.repeat(count, |app| app.word_back()),
 
             // Entering insert mode
             KeyCode::Char('i') => self.enter_insert(),
@@ -313,17 +470,19 @@ impl App {
             }
 
             // Editing / register
-            KeyCode::Char('x') => {
-                if self.cursor.col < self.document.buffer.line_len(self.cursor.row) {
-                    self.checkpoint();
-                    self.document.buffer.delete_char(self.cursor.row, self.cursor.col);
-                    self.after_edit();
-                }
+            KeyCode::Char('x') => self.delete_chars(count),
+            KeyCode::Char('d') => {
+                // The count belongs to the whole `3dd`, so it has to survive
+                // the wait for the second key.
+                self.count = key_had_count.then_some(count);
+                self.pending = Some('d');
             }
-            KeyCode::Char('d') => self.pending = Some('d'),
-            KeyCode::Char('y') => self.pending = Some('y'),
-            KeyCode::Char('p') => self.paste_line(false),
-            KeyCode::Char('P') => self.paste_line(true),
+            KeyCode::Char('y') => {
+                self.count = key_had_count.then_some(count);
+                self.pending = Some('y');
+            }
+            KeyCode::Char('p') => self.paste_line(false, count),
+            KeyCode::Char('P') => self.paste_line(true, count),
             KeyCode::Char('u') => self.undo(),
 
             // Search and help
@@ -454,19 +613,154 @@ impl App {
         self.message.clear();
     }
 
-    fn paste_line(&mut self, above: bool) {
-        let Some(text) = self.register.clone() else {
+    /// Text arriving from the terminal's bracketed paste.
+    ///
+    /// Without bracketed paste the terminal hands pasted text to the editor one
+    /// keystroke at a time, so pasting into Normal mode runs every character as
+    /// a command — which is how a pasted config block turns into a scattering
+    /// of deletions and mode changes. With it, the whole block arrives as one
+    /// event and is inserted as text, never interpreted.
+    ///
+    /// Character-wise in Insert mode, where the user is already typing into a
+    /// line; line-wise in Normal mode, like `p`, because that is what pasting a
+    /// block of configuration into a file actually means.
+    pub fn paste_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        // A terminal may deliver either terminator; neither should end up in
+        // the buffer as a character.
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let lines: Vec<&str> = normalized.split('\n').collect();
+
+        self.checkpoint();
+
+        match self.mode {
+            Mode::Insert => {
+                for (index, line) in lines.iter().enumerate() {
+                    if index > 0 {
+                        self.document.buffer.insert_newline(self.cursor.row, self.cursor.col);
+                        self.cursor.row += 1;
+                        self.cursor.col = 0;
+                    }
+                    for ch in line.chars() {
+                        self.document.buffer.insert_char(self.cursor.row, self.cursor.col, ch);
+                        self.cursor.col += 1;
+                    }
+                }
+            }
+            _ => {
+                let start = self.cursor.row + 1;
+                for (index, line) in lines.iter().enumerate() {
+                    self.document.buffer.insert_line(start + index, (*line).to_string());
+                }
+                self.cursor.row = start;
+                self.cursor.col = 0;
+            }
+        }
+
+        self.after_edit();
+        self.notify(count_message(lines.len(), "pasted"), Level::Info);
+    }
+
+    /// Runs a motion `count` times.
+    ///
+    /// Each step re-reads the buffer, so the motion clamps at the edges the
+    /// same way it does when pressed by hand: `99j` on a five-line file lands
+    /// on the last line, it does not run off the end.
+    fn repeat(&mut self, count: usize, mut step: impl FnMut(&mut Self)) {
+        for _ in 0..count {
+            step(self);
+        }
+    }
+
+    /// `NG`: jump to a line, counted from one.
+    fn goto_line(&mut self, line: usize) {
+        let last = self.document.buffer.line_count().saturating_sub(1);
+        self.cursor.row = line.saturating_sub(1).min(last);
+        self.cursor.col = 0;
+        self.cursor.clamp(&self.document.buffer, self.mode);
+    }
+
+    /// `Nx`: delete up to `count` characters from the cursor, stopping at the
+    /// end of the line rather than eating the newline.
+    fn delete_chars(&mut self, count: usize) {
+        let available = self
+            .document
+            .buffer
+            .line_len(self.cursor.row)
+            .saturating_sub(self.cursor.col);
+        let to_delete = count.min(available);
+        if to_delete == 0 {
+            return;
+        }
+
+        self.checkpoint();
+        for _ in 0..to_delete {
+            self.document.buffer.delete_char(self.cursor.row, self.cursor.col);
+        }
+        self.after_edit();
+    }
+
+    /// The lines a counted line-wise operator would cover, clamped to the end
+    /// of the buffer: `9dd` near the bottom deletes what is left, like Vim.
+    fn lines_from_cursor(&self, count: usize) -> Vec<String> {
+        let last = self.document.buffer.line_count();
+        (self.cursor.row..(self.cursor.row + count).min(last))
+            .filter_map(|row| self.document.buffer.line(row).map(str::to_string))
+            .collect()
+    }
+
+    /// `Ndd`.
+    fn delete_lines(&mut self, count: usize) {
+        let lines = self.lines_from_cursor(count);
+        if lines.is_empty() {
+            return;
+        }
+
+        self.checkpoint();
+        let removed = lines.len();
+        self.register = Some(lines);
+        for _ in 0..removed {
+            self.document.buffer.delete_line(self.cursor.row);
+        }
+        self.after_edit();
+        self.notify(count_message(removed, "deleted and yanked"), Level::Info);
+    }
+
+    /// `Nyy`.
+    fn yank_lines(&mut self, count: usize) {
+        let lines = self.lines_from_cursor(count);
+        if lines.is_empty() {
+            return;
+        }
+
+        let yanked = lines.len();
+        self.register = Some(lines);
+        self.notify(count_message(yanked, "yanked"), Level::Info);
+    }
+
+    fn paste_line(&mut self, above: bool, count: usize) {
+        let Some(lines) = self.register.clone() else {
             self.notify("register empty — use yy or dd first", Level::Warn);
             return;
         };
 
         self.checkpoint();
-        let row = if above { self.cursor.row } else { self.cursor.row + 1 };
-        self.document.buffer.insert_line(row, text);
-        self.cursor.row = row;
+        let start = if above { self.cursor.row } else { self.cursor.row + 1 };
+        let mut row = start;
+        for _ in 0..count {
+            for line in &lines {
+                self.document.buffer.insert_line(row, line.clone());
+                row += 1;
+            }
+        }
+
+        self.cursor.row = start;
         self.cursor.col = 0;
         self.after_edit();
-        self.notify("line pasted", Level::Info);
+        self.notify(count_message(lines.len() * count, "pasted"), Level::Info);
     }
 
     // ── Commands ────────────────────────────────────────────────
@@ -520,11 +814,64 @@ impl App {
                             self.notify(format!("could not write: {error}"), Level::Error);
                         }
                     }
+                } else if let Some(rule) = parse_substitution(other) {
+                    self.substitute(&rule);
                 } else {
                     self.notify(format!("unknown command: {other}"), Level::Error);
                 }
             }
         }
+    }
+
+    /// Runs a parsed `:s`, reporting exactly what it touched.
+    ///
+    /// Nothing is checkpointed until a replacement is certain: a pattern that
+    /// matches nothing must not push an undo step, or `u` would silently
+    /// swallow the user's previous edit instead of the substitution they
+    /// thought they had just made.
+    fn substitute(&mut self, rule: &Substitution) {
+        let rows: Vec<usize> = if rule.whole_file {
+            (0..self.document.buffer.line_count()).collect()
+        } else {
+            vec![self.cursor.row]
+        };
+
+        let mut edits: Vec<(usize, String)> = Vec::new();
+        let mut replacements = 0usize;
+
+        for row in rows {
+            let Some(line) = self.document.buffer.line(row) else { continue };
+            let (new_line, count) = substitute_line(line, rule);
+            if count > 0 {
+                replacements += count;
+                edits.push((row, new_line));
+            }
+        }
+
+        if edits.is_empty() {
+            self.notify(format!("pattern not found: {}", rule.pattern), Level::Warn);
+            return;
+        }
+
+        self.checkpoint();
+        let lines_touched = edits.len();
+        // Land on the first changed line so the user sees the result without
+        // hunting for it.
+        let first_row = edits[0].0;
+        for (row, text) in edits {
+            self.document.buffer.replace_line(row, text);
+        }
+
+        self.cursor.row = first_row;
+        self.cursor.col = 0;
+        self.after_edit();
+
+        let subject = if replacements == 1 { "replacement" } else { "replacements" };
+        let scope = if lines_touched == 1 { "line" } else { "lines" };
+        self.notify(
+            format!("{replacements} {subject} on {lines_touched} {scope}"),
+            Level::Info,
+        );
     }
 
     fn show_info(&mut self) {
@@ -535,7 +882,10 @@ impl App {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "[sin ruta]".to_string());
         self.notify(
-            format!("{path} · {lines} lines · {words} words · {chars} chars"),
+            format!(
+                "{path} · {lines} lines · {words} words · {chars} chars · {}",
+                self.document.line_ending().label()
+            ),
             Level::Info,
         );
     }
@@ -762,6 +1112,363 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// Types a `:` command and runs it, the way a user would.
+    fn command(app: &mut App, text: &str) {
+        press(app, KeyCode::Char(':'));
+        for ch in text.chars() {
+            press(app, KeyCode::Char(ch));
+        }
+        press(app, KeyCode::Enter);
+    }
+
+    /// Types a sequence of plain characters, e.g. "3dd".
+    fn keys(app: &mut App, sequence: &str) {
+        for ch in sequence.chars() {
+            press(app, KeyCode::Char(ch));
+        }
+    }
+
+    // ── Counts ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_count_multiplies_a_motion() {
+        let mut app = app_with("a\nb\nc\nd\ne");
+        keys(&mut app, "3j");
+        assert_eq!(app.cursor.row, 3);
+    }
+
+    #[test]
+    fn a_count_of_more_than_one_digit_works() {
+        let mut app = app_with(&"x\n".repeat(30));
+        keys(&mut app, "12j");
+        assert_eq!(app.cursor.row, 12);
+    }
+
+    #[test]
+    fn zero_is_a_motion_on_its_own_and_a_digit_inside_a_count() {
+        let mut app = app_with("abcdef\nghijkl\nmnopqr");
+        keys(&mut app, "lll");
+        assert_eq!(app.cursor.col, 3);
+
+        // Bare `0`: back to the start of the line, not a count.
+        keys(&mut app, "0");
+        assert_eq!(app.cursor.col, 0);
+        assert_eq!(app.pending_count(), None);
+
+        // `10` then a motion: ten of them, clamped by the buffer.
+        keys(&mut app, "10j");
+        assert_eq!(app.cursor.row, 2, "clamped at the last line");
+    }
+
+    #[test]
+    fn a_motion_clamps_instead_of_running_off_the_end() {
+        let mut app = app_with("uno\ndos");
+        keys(&mut app, "99j");
+        assert_eq!(app.cursor.row, 1);
+
+        keys(&mut app, "99l");
+        assert_eq!(app.cursor.col, 2, "last character of 'dos'");
+    }
+
+    #[test]
+    fn a_count_is_spent_by_one_command_and_does_not_leak() {
+        let mut app = app_with("abcdef\nghijkl");
+        keys(&mut app, "3l");
+        assert_eq!(app.cursor.col, 3);
+        assert_eq!(app.pending_count(), None, "the count was consumed");
+
+        // The next motion is a single step, not another three.
+        keys(&mut app, "l");
+        assert_eq!(app.cursor.col, 4);
+    }
+
+    #[test]
+    fn a_count_deletes_that_many_characters() {
+        let mut app = app_with("abcdef");
+        keys(&mut app, "3x");
+        assert_eq!(app.document.buffer.line(0), Some("def"));
+    }
+
+    #[test]
+    fn deleting_more_characters_than_the_line_has_stops_at_the_end() {
+        let mut app = app_with("ab\ncd");
+        keys(&mut app, "9x");
+        assert_eq!(app.document.buffer.line(0), Some(""));
+        assert_eq!(app.document.buffer.line_count(), 2, "the newline survives");
+    }
+
+    #[test]
+    fn a_count_deletes_that_many_lines() {
+        let mut app = app_with("a\nb\nc\nd");
+        keys(&mut app, "3dd");
+        assert_eq!(app.document.buffer.to_text(), "d");
+        assert_eq!(app.message, "3 lines deleted and yanked");
+    }
+
+    #[test]
+    fn a_counted_delete_is_a_single_undo_step() {
+        let mut app = app_with("a\nb\nc\nd");
+        keys(&mut app, "3dd");
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.document.buffer.to_text(), "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn a_counted_yank_and_paste_round_trip_every_line() {
+        let mut app = app_with("uno\ndos\ntres");
+        keys(&mut app, "2yy");
+        assert_eq!(app.message, "2 lines yanked");
+
+        keys(&mut app, "G");
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.document.buffer.to_text(), "uno\ndos\ntres\nuno\ndos");
+    }
+
+    #[test]
+    fn paste_can_be_counted_too() {
+        let mut app = app_with("uno\ndos");
+        keys(&mut app, "yy");
+        keys(&mut app, "3p");
+        assert_eq!(app.document.buffer.to_text(), "uno\nuno\nuno\nuno\ndos");
+    }
+
+    #[test]
+    fn deleting_past_the_end_of_the_buffer_takes_what_is_there() {
+        let mut app = app_with("a\nb");
+        keys(&mut app, "9dd");
+        assert_eq!(app.document.buffer.line_count(), 1);
+        assert_eq!(app.document.buffer.line(0), Some(""));
+    }
+
+    #[test]
+    fn capital_g_with_a_count_jumps_to_that_line() {
+        let mut app = app_with("1\n2\n3\n4\n5");
+        keys(&mut app, "3G");
+        assert_eq!(app.cursor.row, 2, "lines are counted from one");
+
+        // Bare G still means the last line.
+        keys(&mut app, "G");
+        assert_eq!(app.cursor.row, 4);
+
+        // Past the end, clamp rather than jump into nothing.
+        keys(&mut app, "99G");
+        assert_eq!(app.cursor.row, 4);
+    }
+
+    #[test]
+    fn an_aborted_two_stroke_sequence_drops_its_count() {
+        let mut app = app_with("abcdef\nghijkl");
+        // `3d` then a key that does not complete an operator: nothing happens
+        // to the text, and the 3 must not linger for the next command.
+        keys(&mut app, "3d");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.document.buffer.to_text(), "abcdef\nghijkl");
+
+        keys(&mut app, "l");
+        assert_eq!(app.cursor.col, 1, "one step, not three");
+    }
+
+    // ── Bracketed paste ─────────────────────────────────────────
+
+    #[test]
+    fn pasting_in_normal_mode_inserts_lines_instead_of_running_commands() {
+        let mut app = app_with("primera\nsegunda");
+        // Every character here is a Normal-mode command: without bracketed
+        // paste this text would delete lines and enter insert mode.
+        app.paste_text("dd\nxxx\n:q!");
+
+        assert_eq!(
+            app.document.buffer.to_text(),
+            "primera\ndd\nxxx\n:q!\nsegunda"
+        );
+        assert!(!app.quit, "a pasted :q! must not quit the editor");
+        assert_eq!(app.cursor.row, 1);
+    }
+
+    #[test]
+    fn pasting_in_insert_mode_lands_at_the_cursor() {
+        let mut app = app_with("ac");
+        press(&mut app, KeyCode::Char('l')); // on 'c'
+        press(&mut app, KeyCode::Char('i')); // insert before it
+        app.paste_text("b");
+
+        assert_eq!(app.document.buffer.line(0), Some("abc"));
+    }
+
+    #[test]
+    fn a_multiline_paste_in_insert_mode_splits_the_line() {
+        let mut app = app_with("ad");
+        press(&mut app, KeyCode::Char('l'));
+        press(&mut app, KeyCode::Char('i'));
+        app.paste_text("b\nc");
+
+        assert_eq!(app.document.buffer.to_text(), "ab\ncd");
+    }
+
+    #[test]
+    fn a_paste_is_one_undo_step() {
+        let mut app = app_with("uno");
+        app.paste_text("dos\ntres");
+        assert_eq!(app.document.buffer.line_count(), 3);
+
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.document.buffer.to_text(), "uno");
+    }
+
+    #[test]
+    fn pasted_carriage_returns_never_reach_the_buffer() {
+        // Text copied from a Windows editor arrives with CRLF.
+        let mut app = app_with("uno");
+        app.paste_text("dos\r\ntres");
+
+        assert_eq!(app.document.buffer.to_text(), "uno\ndos\ntres");
+        assert!(app.document.buffer.iter_lines().all(|line| !line.contains('\r')));
+    }
+
+    #[test]
+    fn an_empty_paste_does_nothing_at_all() {
+        let mut app = app_with("uno");
+        app.paste_text("");
+        assert_eq!(app.document.buffer.to_text(), "uno");
+        assert_eq!(app.message, "");
+    }
+
+    // ── :s substitution ─────────────────────────────────────────
+
+    #[test]
+    fn parses_the_basic_substitution_forms() {
+        assert_eq!(
+            parse_substitution("s/foo/bar/"),
+            Some(Substitution {
+                pattern: "foo".into(),
+                replacement: "bar".into(),
+                global: false,
+                whole_file: false,
+            })
+        );
+        assert_eq!(
+            parse_substitution("%s/foo/bar/g"),
+            Some(Substitution {
+                pattern: "foo".into(),
+                replacement: "bar".into(),
+                global: true,
+                whole_file: true,
+            })
+        );
+        // A trailing delimiter is optional, and so is the replacement: `:s/x/`
+        // deletes every x it touches.
+        assert_eq!(
+            parse_substitution("s/x/"),
+            Some(Substitution {
+                pattern: "x".into(),
+                replacement: String::new(),
+                global: false,
+                whole_file: false,
+            })
+        );
+    }
+
+    #[test]
+    fn any_punctuation_can_be_the_delimiter() {
+        // The reason this matters: rewriting a path without escaping slashes.
+        let rule = parse_substitution("%s#/usr/bin#/bin#g").expect("parses");
+        assert_eq!(rule.pattern, "/usr/bin");
+        assert_eq!(rule.replacement, "/bin");
+        assert!(rule.global);
+    }
+
+    #[test]
+    fn the_delimiter_can_still_be_escaped_inside_a_field() {
+        let rule = parse_substitution("s/a\\/b/c/").expect("parses");
+        assert_eq!(rule.pattern, "a/b");
+        assert_eq!(rule.replacement, "c");
+    }
+
+    #[test]
+    fn a_backslash_before_anything_else_stays_literal() {
+        // Config files are full of these; swallowing them would corrupt paths.
+        let rule = parse_substitution("s/C:\\temp/D:\\temp/").expect("parses");
+        assert_eq!(rule.pattern, "C:\\temp");
+        assert_eq!(rule.replacement, "D:\\temp");
+    }
+
+    #[test]
+    fn rejects_things_that_are_not_substitutions() {
+        assert_eq!(parse_substitution("set number"), None);
+        assert_eq!(parse_substitution("sort"), None);
+        assert_eq!(parse_substitution("s"), None);
+        assert_eq!(parse_substitution("s//bar/"), None, "an empty pattern is meaningless");
+        assert_eq!(parse_substitution("s/a/b/x"), None, "unknown flag");
+    }
+
+    #[test]
+    fn substitutes_the_first_match_on_the_current_line() {
+        let mut app = app_with("uno dos uno\nuno");
+        command(&mut app, "s/uno/UNO/");
+
+        assert_eq!(app.document.buffer.line(0), Some("UNO dos uno"));
+        assert_eq!(app.document.buffer.line(1), Some("uno"), "other lines untouched");
+        assert_eq!(app.message, "1 replacement on 1 line");
+    }
+
+    #[test]
+    fn the_g_flag_takes_every_match_on_the_line() {
+        let mut app = app_with("uno dos uno");
+        command(&mut app, "s/uno/UNO/g");
+
+        assert_eq!(app.document.buffer.line(0), Some("UNO dos UNO"));
+        assert_eq!(app.message, "2 replacements on 1 line");
+    }
+
+    #[test]
+    fn percent_reaches_the_whole_file() {
+        let mut app = app_with("uno\ndos uno\ntres");
+        command(&mut app, "%s/uno/UNO/g");
+
+        assert_eq!(app.document.buffer.to_text(), "UNO\ndos UNO\ntres");
+        assert_eq!(app.message, "2 replacements on 2 lines");
+    }
+
+    #[test]
+    fn a_substitution_is_one_undo_step() {
+        let mut app = app_with("uno\nuno\nuno");
+        command(&mut app, "%s/uno/dos/g");
+        assert_eq!(app.document.buffer.to_text(), "dos\ndos\ndos");
+
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.document.buffer.to_text(), "uno\nuno\nuno");
+    }
+
+    #[test]
+    fn a_pattern_that_matches_nothing_changes_nothing_and_costs_no_undo_step() {
+        let mut app = app_with("uno");
+        // A real edit first, so there is something on the undo stack to lose.
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.document.buffer.line(0), Some("no"));
+
+        command(&mut app, "s/zzz/algo/");
+        assert_eq!(app.message, "pattern not found: zzz");
+        assert_eq!(app.level, Level::Warn);
+
+        // `u` must undo the `x`, not a no-op substitution.
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.document.buffer.line(0), Some("uno"));
+    }
+
+    #[test]
+    fn substitution_can_delete_by_replacing_with_nothing() {
+        let mut app = app_with("quitar esto");
+        command(&mut app, "s/ esto//");
+        assert_eq!(app.document.buffer.line(0), Some("quitar"));
+    }
+
+    #[test]
+    fn the_cursor_lands_on_the_first_line_it_changed() {
+        let mut app = app_with("nada\nnada\naqui\nnada");
+        command(&mut app, "%s/aqui/alli/");
+        assert_eq!(app.cursor.row, 2);
     }
 
     #[test]

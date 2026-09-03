@@ -103,13 +103,23 @@ whole document after every keystroke.
 - [x] `$EDITOR`-safe exit codes.
 - [x] 16-colour degradation for appliance consoles.
 
-### Still open for 0.3.x
+### 0.3.x — shipped
 
-- Simple substitution `:s/pattern/replacement/`.
-- Counts for motions and operations.
-- Preserve CRLF/LF line endings.
-- Bracketed paste.
-- Safe terminal restoration on panic.
+- [x] Simple substitution: `:s/old/new/`, `:s/old/new/g`, `:%s/old/new/g`, with
+      any punctuation usable as the delimiter so paths need no escaping.
+      Matching is literal, like `/` — a pattern that quietly means something
+      else is the last thing a sudoers file needs.
+- [x] Counts for motions and operations: `3j`, `12G`, `5x`, `2dd`, `3p`. A
+      leading `0` still means start-of-line; a `0` inside a count is a digit.
+- [x] Preserve CRLF/LF line endings. Detected on open, restored on save, and
+      surfaced in `:info`, so editing a Windows config on Linux stays a
+      one-line diff instead of a whole-file rewrite.
+- [x] Bracketed paste: a pasted block arrives as one event and is inserted as
+      text. Before this, pasting into Normal mode ran every character as a
+      command.
+- [x] Safe terminal restoration on panic: a hook leaves the alternate screen
+      and raw mode before the panic message is printed, so an appliance console
+      is never left unusable with an unreadable error on it.
 
 ### 0.4
 

@@ -289,6 +289,10 @@ pull requests. Formatting and Clippy remain recommended local pre-commit checks.
 - [x] External-change detection and live SHA-256.
 - [x] Atomic cross-platform save replacement.
 - [x] Audit events, `--verify` mode and `$EDITOR`-safe exit codes.
+- [x] Substitution (`:s`, `:%s`, `/g`) with any delimiter.
+- [x] Counts for motions and operations (`3j`, `12G`, `2dd`, `3p`).
+- [x] CRLF/LF line endings preserved across a save.
+- [x] Bracketed paste, and a terminal that survives a panic.
 - [ ] Visual mode and character-wise operators.
 - [ ] Configurable key map, theme and editor options.
 - [ ] Syntax highlighting with language detection.

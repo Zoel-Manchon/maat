@@ -16,10 +16,59 @@ use std::path::{Path, PathBuf};
 
 use super::buffer::Buffer;
 
+/// How the file terminates its lines.
+///
+/// The buffer always holds lines without terminators, so everything above this
+/// module works in one representation. What the file used is remembered here
+/// and put back on save: opening a CRLF file on Linux and saving it must not
+/// silently rewrite every line, which would turn a one-word edit into a diff
+/// against the whole file — and, on a config an appliance ships, into a
+/// checksum mismatch nobody asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEnding {
+    /// A bare newline — the default for a new buffer, and for anything mixed.
+    Lf,
+    /// Carriage return + newline, kept byte-for-byte when that is what came in.
+    Crlf,
+}
+
+impl LineEnding {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LineEnding::Lf => "\n",
+            LineEnding::Crlf => "\r\n",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LineEnding::Lf => "LF",
+            LineEnding::Crlf => "CRLF",
+        }
+    }
+
+    /// Decide from the text as read.
+    ///
+    /// A file counts as CRLF when it has at least one CRLF and *every* newline
+    /// in it is one. Mixed endings stay LF: rewriting the odd ones out would be
+    /// an edit the user never asked for, so those stray carriage returns are
+    /// left exactly as they came in, as characters inside the line.
+    fn detect(text: &str) -> Self {
+        let crlf = text.matches("\r\n").count();
+        if crlf > 0 && crlf == text.matches('\n').count() {
+            LineEnding::Crlf
+        } else {
+            LineEnding::Lf
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Document {
     pub buffer: Buffer,
     path: Option<PathBuf>,
+    /// The terminator this file used when we read it, restored on every save.
+    line_ending: LineEnding,
     /// SHA-256 of the contents as they were on disk the last time we read or
     /// wrote them. `None` for a buffer with no file behind it yet.
     disk_hash: Option<String>,
@@ -46,6 +95,7 @@ impl Default for Document {
         Self {
             buffer: Buffer::default(),
             path: None,
+            line_ending: LineEnding::Lf,
             disk_hash: None,
             saved_hash: Some(hash_text("")),
         }
@@ -59,9 +109,19 @@ impl Document {
         match fs::read_to_string(path) {
             Ok(text) => {
                 let hash = hash_text(&text);
+                let line_ending = LineEnding::detect(&text);
+                // The buffer never sees the terminators: a CRLF file would
+                // otherwise leave a stray carriage return at the end of every
+                // line, which renders as a control glyph and throws off every
+                // column calculation downstream.
+                let normalized = match line_ending {
+                    LineEnding::Crlf => text.replace("\r\n", "\n"),
+                    LineEnding::Lf => text,
+                };
                 Ok(Self {
-                    buffer: Buffer::from_text(&text),
+                    buffer: Buffer::from_text(&normalized),
                     path: Some(path.to_path_buf()),
+                    line_ending,
                     disk_hash: Some(hash.clone()),
                     saved_hash: Some(hash),
                 })
@@ -106,6 +166,7 @@ impl Document {
         Self {
             buffer: Buffer::from_text(text),
             path: None,
+            line_ending: LineEnding::Lf,
             disk_hash: None,
             saved_hash: Some(hash),
         }
@@ -117,9 +178,32 @@ impl Document {
         self.saved_hash.as_deref() != Some(current_hash)
     }
 
+    pub fn line_ending(&self) -> LineEnding {
+        self.line_ending
+    }
+
+    /// The bytes a save would write: the buffer re-joined with the file's own
+    /// terminator. Everything that hashes or compares against disk goes
+    /// through here, so a CRLF file never looks modified just for being CRLF.
+    pub fn to_disk_text(&self) -> String {
+        match self.line_ending {
+            LineEnding::Lf => self.buffer.to_text(),
+            LineEnding::Crlf => {
+                let mut out = String::new();
+                for (index, line) in self.buffer.iter_lines().enumerate() {
+                    if index > 0 {
+                        out.push_str("\r\n");
+                    }
+                    out.push_str(line);
+                }
+                out
+            }
+        }
+    }
+
     /// SHA-256 of the **current buffer contents** (what a save would write).
     pub fn buffer_hash(&self) -> String {
-        hash_text(&self.buffer.to_text())
+        hash_text(&self.to_disk_text())
     }
 
     /// Compares the file on disk with the one we read. Called before saving:
@@ -144,7 +228,7 @@ impl Document {
         let Some(path) = self.path.clone() else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "document has no path"));
         };
-        let text = self.buffer.to_text();
+        let text = self.to_disk_text();
         write_atomic(&path, &text)?;
 
         let hash = hash_text(&text);
@@ -354,5 +438,82 @@ mod tests {
 
         // After saving, our contents ARE the disk contents: no false alarms.
         assert_eq!(document.disk_state(), DiskState::Unchanged);
+    }
+
+    // ── Line endings ────────────────────────────────────────────
+
+    #[test]
+    fn detects_the_terminator_the_file_actually_uses() {
+        assert_eq!(LineEnding::detect("a\nb\n"), LineEnding::Lf);
+        assert_eq!(LineEnding::detect("a\r\nb\r\n"), LineEnding::Crlf);
+        assert_eq!(LineEnding::detect("no newline at all"), LineEnding::Lf);
+        // Mixed: not every newline is a CRLF, so we refuse to guess and leave
+        // the file alone rather than rewriting the odd lines out.
+        assert_eq!(LineEnding::detect("a\r\nb\nc"), LineEnding::Lf);
+    }
+
+    #[test]
+    fn a_crlf_file_is_read_without_stray_carriage_returns() {
+        let dir = temp_dir("crlf_read");
+        let file = dir.join("windows.txt");
+        fs::write(&file, "uno\r\ndos\r\ntres").unwrap();
+
+        let document = Document::open(&file).unwrap();
+
+        assert_eq!(document.line_ending(), LineEnding::Crlf);
+        assert_eq!(document.buffer.line_count(), 3);
+        assert_eq!(document.buffer.line(0), Some("uno"));
+        assert_eq!(document.buffer.line(1), Some("dos"));
+        // The buffer holds no terminators at all — column arithmetic upstream
+        // depends on that.
+        assert!(document.buffer.iter_lines().all(|line| !line.contains('\r')));
+    }
+
+    #[test]
+    fn a_crlf_file_stays_crlf_when_saved() {
+        let dir = temp_dir("crlf_save");
+        let file = dir.join("config.ini");
+        fs::write(&file, "clave=1\r\notra=2").unwrap();
+
+        let mut document = Document::open(&file).unwrap();
+        document.buffer.insert_char(0, 7, '0');
+        document.save().unwrap();
+
+        let written = fs::read_to_string(&file).unwrap();
+        assert_eq!(written, "clave=10\r\notra=2");
+    }
+
+    #[test]
+    fn an_lf_file_never_grows_carriage_returns() {
+        let dir = temp_dir("lf_save");
+        let file = dir.join("script.sh");
+        fs::write(&file, "#!/bin/sh\necho hola").unwrap();
+
+        let mut document = Document::open(&file).unwrap();
+        assert_eq!(document.line_ending(), LineEnding::Lf);
+
+        document.buffer.insert_char(1, 4, '!');
+        document.save().unwrap();
+
+        let written = fs::read_to_string(&file).unwrap();
+        assert!(!written.contains('\r'));
+        assert_eq!(written, "#!/bin/sh\necho! hola");
+    }
+
+    #[test]
+    fn opening_a_crlf_file_and_saving_it_untouched_is_a_byte_identical_write() {
+        // The point of the whole exercise: a one-key edit must not turn into a
+        // diff against every line, and a file left alone must hash the same.
+        let dir = temp_dir("crlf_identity");
+        let file = dir.join("hosts");
+        let original = "127.0.0.1 localhost\r\n::1 localhost\r\n";
+        fs::write(&file, original).unwrap();
+
+        let mut document = Document::open(&file).unwrap();
+        assert!(!document.is_modified());
+        assert_eq!(document.disk_state(), DiskState::Unchanged);
+
+        document.save().unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), original);
     }
 }

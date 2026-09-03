@@ -105,6 +105,15 @@ impl Buffer {
         self.lines.insert(at, text);
     }
 
+    /// Swaps a whole line for new contents. What `:s` writes back after it has
+    /// rewritten a line; out-of-range rows are ignored rather than panicking,
+    /// like every other mutator here.
+    pub fn replace_line(&mut self, row: usize, text: String) -> bool {
+        let Some(line) = self.lines.get_mut(row) else { return false };
+        *line = text;
+        true
+    }
+
     pub fn iter_lines(&self) -> impl Iterator<Item = &str> {
         self.lines.iter().map(String::as_str)
     }
@@ -173,6 +182,14 @@ mod tests {
         assert_eq!(buffer.line(0), Some("hello world"));
         assert_eq!(buffer.line_count(), 1);
         assert!(!buffer.join_line(0));
+    }
+
+    #[test]
+    fn replaces_a_whole_line() {
+        let mut buffer = Buffer::from_text("uno\ndos");
+        assert!(buffer.replace_line(1, "DOS".into()));
+        assert_eq!(buffer.to_text(), "uno\nDOS");
+        assert!(!buffer.replace_line(9, "nada".into()));
     }
 
     #[test]
