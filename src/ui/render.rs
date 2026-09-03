@@ -256,7 +256,13 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let name = app.document.name();
     let modified = if app.is_modified() { " [+]" } else { "" };
     let hash: String = app.hash().chars().take(10).collect();
-    let position = format!(" {}:{} ", app.cursor.row + 1, app.cursor.col + 1);
+    // A count in progress is echoed next to the position, the way Vim shows it
+    // in the bottom right: typing `12` and then walking away should not leave
+    // the next keystroke doing something twelve times without warning.
+    let position = match app.pending_count() {
+        Some(count) => format!(" {count} · {}:{} ", app.cursor.row + 1, app.cursor.col + 1),
+        None => format!(" {}:{} ", app.cursor.row + 1, app.cursor.col + 1),
+    };
     let (lines, words, chars) = app.stats();
 
     let mut left = vec![

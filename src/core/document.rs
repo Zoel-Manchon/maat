@@ -187,16 +187,12 @@ impl Document {
     /// through here, so a CRLF file never looks modified just for being CRLF.
     pub fn to_disk_text(&self) -> String {
         match self.line_ending {
+            // The common path, and a hot one: `buffer_hash` runs after every
+            // edit, so LF files skip the re-join entirely.
             LineEnding::Lf => self.buffer.to_text(),
             LineEnding::Crlf => {
-                let mut out = String::new();
-                for (index, line) in self.buffer.iter_lines().enumerate() {
-                    if index > 0 {
-                        out.push_str("\r\n");
-                    }
-                    out.push_str(line);
-                }
-                out
+                let lines: Vec<&str> = self.buffer.iter_lines().collect();
+                lines.join(self.line_ending.as_str())
             }
         }
     }
