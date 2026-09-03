@@ -12,6 +12,7 @@ use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::core::config::Config;
 use crate::core::document::{DiskState, Document};
 use crate::ui::app::App;
 
@@ -29,6 +30,12 @@ OPTIONS:
 ENVIRONMENT:
     MAAT_AUDIT_LOG      append a structured event to this path on every save
     MAAT_AUDIT_FORMAT   `json` (default) or `cef`
+    MAAT_CONFIG         config file to read instead of the usual locations
+    MAAT_CLIPBOARD      1 to mirror yanks to the terminal clipboard (OSC 52)
+
+CONFIG:
+    $XDG_CONFIG_HOME/maat/config.toml, or ~/.config/maat/config.toml
+    (%APPDATA%/maat/config.toml on Windows). See docs/config.example.toml.
 
 EXIT CODES:
     0  clean exit
@@ -101,10 +108,27 @@ fn edit(path: Option<PathBuf>) -> io::Result<ExitCode> {
         None => Document::default(),
     };
 
+    // Read before the first frame: the theme caches its colour decision on
+    // first use, so the config has to get there first.
+    let config = Config::load();
+    if config.force_16_colour {
+        ui::theme::force_16_colour();
+    }
+
+    let mut app = App::with_config(document, config.clone());
+    if !config.unknown.is_empty() {
+        // Not fatal, but not silent either: a typo in a key name should be
+        // visible the moment the editor opens, not the day someone wonders why
+        // their setting never worked.
+        let first = config.unknown[0].clone();
+        let extra = config.unknown.len() - 1;
+        app.warn_about_config(&first, extra);
+    }
+
     install_panic_hook();
 
     let mut terminal = setup_terminal()?;
-    let outcome = run(&mut terminal, App::new(document));
+    let outcome = run(&mut terminal, app);
     restore_terminal(&mut terminal)?;
 
     // Exit code 2 on an abandoned edit: `visudo`, `crontab -e` and friends

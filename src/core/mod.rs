@@ -4,6 +4,7 @@
 pub mod audit;
 pub mod buffer;
 pub mod clipboard;
+pub mod config;
 pub mod cursor;
 pub mod document;
 pub mod mode;

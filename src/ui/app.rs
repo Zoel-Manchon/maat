@@ -11,11 +11,10 @@ use std::path::Path;
 use crate::core::audit::{self, SaveEvent};
 use crate::core::buffer::Buffer;
 use crate::core::clipboard;
+use crate::core::config::Config;
 use crate::core::cursor::Cursor;
 use crate::core::document::{DiskState, Document};
 use crate::core::mode::Mode;
-
-const HISTORY_LIMIT: usize = 512;
 
 /// Severity of the message shown on the bottom line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +280,11 @@ pub struct App {
     /// screen — that is the property that lets every one of these tests run
     /// without a terminal — so the event loop drains this instead.
     clipboard_out: Option<String>,
+    /// Columns a tab stands for, and whether Tab inserts spaces instead.
+    pub tab_width: usize,
+    pub expand_tabs: bool,
+    /// Undo snapshots kept, from the config.
+    history_limit: usize,
     pub quit: bool,
     /// True when the session ended via `:q!` with unsaved changes on the table.
     /// `visudo` and friends rely on a non-zero exit to know the edit was
@@ -289,7 +293,17 @@ pub struct App {
 }
 
 impl App {
+    /// An editor with the shipped defaults.
+    ///
+    /// Test-only: the binary always goes through `with_config`, so that the
+    /// config file is the single place a default can be overridden and there
+    /// is no second path where one could quietly differ.
+    #[cfg(test)]
     pub fn new(document: Document) -> Self {
+        Self::with_config(document, Config::default())
+    }
+
+    pub fn with_config(document: Document, config: Config) -> Self {
         let hash_cache = document.buffer_hash();
         Self {
             document,
@@ -303,7 +317,7 @@ impl App {
             message: String::new(),
             level: Level::Info,
             show_help: false,
-            relative_numbers: false,
+            relative_numbers: config.relative_numbers,
             pending: None,
             count: None,
             search_origin: Cursor::default(),
@@ -312,7 +326,14 @@ impl App {
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             hash_cache,
-            clipboard: std::env::var("MAAT_CLIPBOARD").is_ok_and(|value| value != "0"),
+            tab_width: config.tab_width,
+            expand_tabs: config.expand_tabs,
+            history_limit: config.history_limit,
+            // The environment wins over the file: it is the thing someone
+            // sets for one session, on a box whose config they cannot edit.
+            clipboard: std::env::var("MAAT_CLIPBOARD")
+                .map(|value| value != "0")
+                .unwrap_or(config.clipboard),
             clipboard_out: None,
             quit: false,
             discarded: false,
@@ -321,6 +342,18 @@ impl App {
 
     pub fn hash(&self) -> &str {
         &self.hash_cache
+    }
+
+    /// Says on the message line that the config file has a line the editor did
+    /// not understand — a typo in a key name should be visible the moment the
+    /// editor opens, not the day someone wonders why their setting never took.
+    pub fn warn_about_config(&mut self, line: &str, extra: usize) {
+        let more = if extra > 0 {
+            format!(" (+{extra} more)")
+        } else {
+            String::new()
+        };
+        self.notify(format!("config: ignored \"{line}\"{more}"), Level::Warn);
     }
 
     /// Hands the event loop anything the terminal should be told, and forgets
@@ -409,7 +442,7 @@ impl App {
 
     /// Records an undo point immediately before a mutation.
     fn checkpoint(&mut self) {
-        if self.undo_stack.len() == HISTORY_LIMIT {
+        if self.undo_stack.len() >= self.history_limit {
             self.undo_stack.pop_front();
         }
         self.undo_stack.push_back(self.snapshot());
@@ -936,12 +969,33 @@ impl App {
                     self.after_edit();
                 }
             }
+            KeyCode::Tab => self.insert_tab(),
             KeyCode::Left => self.cursor.left(),
             KeyCode::Right => self.cursor.right(&self.document.buffer, self.mode),
             KeyCode::Up => self.cursor.up(&self.document.buffer, self.mode),
             KeyCode::Down => self.cursor.down(&self.document.buffer, self.mode),
             _ => {}
         }
+    }
+
+    /// Tab in Insert mode: a real tab, or the spaces that stand in for one.
+    ///
+    /// With `expandtabs`, the jump is to the next tab stop rather than a fixed
+    /// number of spaces — pressing Tab in column 3 with a width of 4 should
+    /// land on column 4, not column 7.
+    fn insert_tab(&mut self) {
+        self.checkpoint();
+        if self.expand_tabs {
+            let spaces = self.tab_width - (self.cursor.col % self.tab_width);
+            for _ in 0..spaces {
+                self.document.buffer.insert_char(self.cursor.row, self.cursor.col, ' ');
+                self.cursor.col += 1;
+            }
+        } else {
+            self.document.buffer.insert_char(self.cursor.row, self.cursor.col, '\t');
+            self.cursor.col += 1;
+        }
+        self.after_edit();
     }
 
     fn handle_command(&mut self, key: KeyEvent) {
@@ -1837,6 +1891,74 @@ mod tests {
 
         keys(&mut app, "l");
         assert_eq!(app.cursor.col, 1, "one step, not three");
+    }
+
+    // ── Configuration ───────────────────────────────────────────
+
+    fn app_with_config(text: &str, config: Config) -> App {
+        App::with_config(Document::from_text_for_test(text), config)
+    }
+
+    #[test]
+    fn tab_inserts_a_tab_character_by_default() {
+        let mut app = app_with("ab");
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.document.buffer.line(0), Some("\tab"));
+    }
+
+    #[test]
+    fn expandtabs_inserts_spaces_up_to_the_next_tab_stop() {
+        let config = Config { expand_tabs: true, tab_width: 4, ..Config::default() };
+        let mut app = app_with_config("ab", config);
+
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.document.buffer.line(0), Some("    ab"), "column 0 → four spaces");
+
+        // From column 5, the next stop is 8: three spaces, not another four.
+        press(&mut app, KeyCode::Char('X'));
+        assert_eq!(app.cursor.col, 5);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.document.buffer.line(0), Some("    X   ab"));
+        assert_eq!(app.cursor.col, 8);
+    }
+
+    #[test]
+    fn a_tab_is_one_undo_step() {
+        let config = Config { expand_tabs: true, ..Config::default() };
+        let mut app = app_with_config("ab", config);
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.document.buffer.line(0), Some("ab"));
+    }
+
+    #[test]
+    fn the_config_can_switch_on_relative_numbers_and_the_clipboard() {
+        let config = Config { relative_numbers: true, clipboard: true, ..Config::default() };
+        let app = app_with_config("uno", config);
+        assert!(app.relative_numbers);
+        assert!(app.clipboard);
+    }
+
+    #[test]
+    fn the_history_limit_from_the_config_is_honoured() {
+        let config = Config { history_limit: 3, ..Config::default() };
+        let mut app = app_with_config("abcdefghij", config);
+
+        // Six edits against a three-deep history.
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Char('x'));
+        }
+        assert_eq!(app.document.buffer.line(0), Some("ghij"));
+
+        // Only the last three are recoverable; the rest fell off the front.
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Char('u'));
+        }
+        assert_eq!(app.document.buffer.line(0), Some("defghij"));
     }
 
     // ── System clipboard (OSC 52) ───────────────────────────────

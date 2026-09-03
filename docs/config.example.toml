@@ -1,0 +1,47 @@
+# maat — example configuration
+#
+# Copy to one of these, whichever fits the machine:
+#
+#   $MAAT_CONFIG                       explicit, wins over everything
+#   $XDG_CONFIG_HOME/maat/config.toml
+#   ~/.config/maat/config.toml
+#   %APPDATA%\maat\config.toml         on Windows
+#
+# Every key below is optional and shown at its default. A missing file is not
+# an error: an appliance with a read-only root has to boot without one.
+#
+# maat reads a deliberate subset of TOML — comments, bare keys, [table]
+# headers, and string, boolean and integer values. No arrays, no nested
+# tables. A line it does not understand is reported on the message line when
+# the editor opens rather than being ignored in silence, so a typo in a key
+# name is visible immediately.
+
+[display]
+
+# Number lines relative to the cursor instead of absolutely. Same as
+# `:set relativenumber` at runtime.
+relativenumber = false
+
+# Columns a tab stands for.
+tabwidth = 4
+
+# Insert spaces up to the next tab stop instead of a tab character. The jump
+# is to the stop, not a fixed count: Tab in column 3 with a width of 4 lands
+# on column 4.
+expandtabs = false
+
+# Force the 16-colour palette instead of trusting COLORTERM. Worth setting on
+# an appliance console, or under a multiplexer that strips the variable — and
+# on a terminal that claims true colour and then renders mud.
+force16colour = false
+
+[editor]
+
+# Mirror yanks to the terminal's clipboard with OSC 52, which works through
+# SSH and needs no display server. Off by default because a few old terminals
+# echo the escape sequence as text instead of acting on it. `MAAT_CLIPBOARD=1`
+# overrides this for a single session, on a box whose config you cannot edit.
+clipboard = false
+
+# Undo snapshots kept in memory.
+historylimit = 512

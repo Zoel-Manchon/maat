@@ -178,6 +178,36 @@ state: unchanged
 Exit code `2` is what makes Maat safe as `$EDITOR`: `visudo` and `crontab -e`
 read it to know they must not install a half-edited file.
 
+## Configuration
+
+maat reads an optional `config.toml` at startup — from `$MAAT_CONFIG`, else
+`$XDG_CONFIG_HOME/maat/config.toml`, else `~/.config/maat/config.toml`
+(`%APPDATA%\maat\config.toml` on Windows). A missing file is not an error: an
+appliance with a read-only root has to boot without one.
+
+```toml
+[display]
+relativenumber = false
+tabwidth       = 4
+expandtabs     = false
+force16colour  = false   # skip COLORTERM detection
+
+[editor]
+clipboard    = false     # mirror yanks to the terminal clipboard (OSC 52)
+historylimit = 512
+```
+
+The parser handles a deliberate subset of TOML — comments, bare keys, `[table]`
+headers, and string, boolean and integer values. That is a choice, not a
+shortcut: `toml` + `serde` would roughly quadruple a three-crate dependency
+tree in a binary whose point is being small enough to ship inside an appliance
+image. A line maat does not understand is reported on the message line when the
+editor opens, so a typo in a key name is visible immediately instead of
+silently doing nothing.
+
+The full annotated example lives in
+[`docs/config.example.toml`](docs/config.example.toml).
+
 ## Audit trail
 
 Editing a config file on a hardened host is a security-relevant act. Set

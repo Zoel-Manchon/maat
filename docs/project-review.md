@@ -141,7 +141,13 @@ whole document after every keystroke.
       old terminals echo the sequence instead of acting on it. Base64 is
       written out rather than pulled in — a dependency for forty lines of table
       lookup is a bad trade in a binary meant to stay small and auditable.
-- TOML configuration for theme, tabs and numbers.
+- [x] TOML configuration for theme, tabs and numbers, read from
+      `$MAAT_CONFIG` / `$XDG_CONFIG_HOME` / `~/.config` and degrading to the
+      defaults when there is none — the read-only-root constraint the appliance
+      section calls for. The parser is a hand-written TOML subset rather than
+      `toml` + `serde`: a dozen scalars are not worth quadrupling a three-crate
+      dependency tree in a binary that has to stay small and auditable. Keys it
+      does not recognise are reported on the message line, not swallowed.
 - File picker and multiple buffers.
 
 ### 0.5

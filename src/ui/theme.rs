@@ -16,10 +16,25 @@ use std::sync::OnceLock;
 fn truecolor() -> bool {
     static TRUECOLOR: OnceLock<bool> = OnceLock::new();
     *TRUECOLOR.get_or_init(|| {
+        if FORCE_16_COLOUR.get().copied().unwrap_or(false) {
+            return false;
+        }
         std::env::var("COLORTERM")
             .map(|value| value.contains("truecolor") || value.contains("24bit"))
             .unwrap_or(false)
     })
+}
+
+/// Set from the config before anything is drawn.
+///
+/// `COLORTERM` lies in both directions — a multiplexer that strips it, a
+/// terminal that claims true colour and renders mud — so the config gets the
+/// last word. It has to be set before the first `truecolor()` call, because
+/// that answer is cached for the life of the process.
+static FORCE_16_COLOUR: OnceLock<bool> = OnceLock::new();
+
+pub fn force_16_colour() {
+    let _ = FORCE_16_COLOUR.set(true);
 }
 
 /// Picks the 24-bit colour or its indexed fallback, depending on the terminal.
