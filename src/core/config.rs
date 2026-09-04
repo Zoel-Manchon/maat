@@ -38,6 +38,12 @@ pub struct Config {
     pub force_16_colour: bool,
     /// Lines of undo history kept.
     pub history_limit: usize,
+    /// Raw `[keys]` bindings as `(pressed, acts_as)`, case preserved.
+    ///
+    /// Left as strings on purpose: turning them into key codes needs
+    /// crossterm, and `core` does not depend on the terminal. `ui::keymap`
+    /// does that translation.
+    pub keys: Vec<(String, String)>,
     /// Lines that were understood but not recognised, reported once at startup
     /// so a typo in a key name is visible rather than silently ignored.
     pub unknown: Vec<String>,
@@ -54,6 +60,7 @@ impl Default for Config {
             // Deep enough that no realistic editing session hits it, small
             // enough that 512 full buffer snapshots stay cheap on an appliance.
             history_limit: 512,
+            keys: Vec::new(),
             unknown: Vec::new(),
         }
     }
@@ -115,7 +122,11 @@ impl Config {
                 config.unknown.push(line.to_string());
                 continue;
             };
-            let key = key.trim().to_ascii_lowercase();
+            // Everywhere but `[keys]`, option names are words and case does
+            // not matter. Inside it, the name *is* a key: `g` and `G` are two
+            // different commands, so the case has to survive.
+            let raw_key = key.trim().to_string();
+            let key = if table == "keys" { raw_key.clone() } else { raw_key.to_ascii_lowercase() };
             let value = value.trim();
             let qualified = if table.is_empty() {
                 key.clone()
@@ -141,6 +152,12 @@ impl Config {
                 }
                 "editor.historylimit" | "historylimit" => {
                     assign_usize(value, &mut config.history_limit, line, &mut config.unknown)
+                }
+                _ if table == "keys" => {
+                    // Values are quoted in TOML; the quotes are not part of
+                    // the key name.
+                    let target = value.trim_matches('"').to_string();
+                    config.keys.push((key.clone(), target));
                 }
                 _ => config.unknown.push(line.to_string()),
             }
@@ -280,6 +297,30 @@ mod tests {
 
         let config = Config::parse("tabwidth = 999");
         assert_eq!(config.tab_width, 16);
+    }
+
+    #[test]
+    fn the_keys_table_collects_bindings_in_order() {
+        let config = Config::parse("[keys]\nt = \"j\"\nn = \"k\"");
+        assert_eq!(
+            config.keys,
+            vec![("t".into(), "j".into()), ("n".into(), "k".into())]
+        );
+        assert!(config.unknown.is_empty(), "bindings are not 'unknown' options");
+    }
+
+    #[test]
+    fn key_names_keep_their_case_while_option_names_do_not() {
+        // `g` and `G` are different commands, so a binding's case is meaning.
+        let config = Config::parse("[keys]\nG = \"j\"\n\n[display]\nRelativeNumber = true");
+        assert_eq!(config.keys, vec![("G".into(), "j".into())]);
+        assert!(config.relative_numbers, "option names stay case-insensitive");
+    }
+
+    #[test]
+    fn a_binding_is_read_without_its_quotes() {
+        assert_eq!(Config::parse("[keys]\nt = \"Left\"").keys, vec![("t".into(), "Left".into())]);
+        assert_eq!(Config::parse("[keys]\nt = Left").keys, vec![("t".into(), "Left".into())]);
     }
 
     #[test]

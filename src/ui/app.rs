@@ -16,6 +16,7 @@ use crate::core::journal::Journal;
 use crate::core::cursor::Cursor;
 use crate::core::document::{DiskState, Document};
 use crate::core::mode::Mode;
+use crate::ui::keymap::KeyMap;
 
 /// Edits between journal writes. Small enough that a crash costs a sentence,
 /// large enough that the editor is not writing a file on every keystroke.
@@ -290,6 +291,8 @@ pub struct App {
     pub expand_tabs: bool,
     /// Undo snapshots kept, from the config.
     history_limit: usize,
+    /// User key bindings, applied before anything else looks at the key.
+    keymap: KeyMap,
     /// Where unsaved work is mirrored so a crash does not take it with it.
     /// `None` when there is nowhere writable to put it.
     journal: Option<Journal>,
@@ -343,6 +346,7 @@ impl App {
             tab_width: config.tab_width,
             expand_tabs: config.expand_tabs,
             history_limit: config.history_limit,
+            keymap: KeyMap::from_pairs(&config.keys).0,
             journal: Journal::discover(),
             edits_since_journal: 0,
             pending_recovery: false,
@@ -633,7 +637,21 @@ impl App {
 
     // ── Input ───────────────────────────────────────────────────
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    pub fn handle_key(&mut self, mut key: KeyEvent) {
+        // Rebinding happens here and nowhere else: past this line the rest of
+        // the editor only ever sees canonical keys, so counts, operators,
+        // visual mode and the two-stroke sequences need to know nothing about
+        // it.
+        //
+        // Only the modes where a key is a *command*. In Insert, Command and
+        // Search a key is text: a remapped `t` has to type a `t`, or the file
+        // gets the keymap instead of the words, and `:wq` becomes unspellable
+        // for anyone who rebound `w`.
+        let key_is_a_command = matches!(self.mode, Mode::Normal | Mode::Visual | Mode::VisualLine);
+        if key_is_a_command && !self.keymap.is_empty() {
+            key.code = self.keymap.resolve(key.code);
+        }
+
         if self.show_help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')) {
                 self.show_help = false;
@@ -2041,6 +2059,85 @@ mod tests {
 
         keys(&mut app, "l");
         assert_eq!(app.cursor.col, 1, "one step, not three");
+    }
+
+    // ── Key map ─────────────────────────────────────────────────
+
+    fn app_with_keys(text: &str, keys: &[(&str, &str)]) -> App {
+        let config = Config {
+            keys: keys.iter().map(|(a, b)| ((*a).to_string(), (*b).to_string())).collect(),
+            ..Config::default()
+        };
+        App::with_config(Document::from_text_for_test(text), config)
+    }
+
+    #[test]
+    fn a_rebound_key_drives_the_command_it_points_at() {
+        // The Dvorak layout, where `hjkl` is not a home row.
+        let mut app = app_with_keys("a\nb\nc\nd", &[("t", "j"), ("n", "k")]);
+        keys(&mut app, "tt");
+        assert_eq!(app.cursor.row, 2);
+        keys(&mut app, "n");
+        assert_eq!(app.cursor.row, 1);
+    }
+
+    #[test]
+    fn a_rebound_key_still_composes_with_counts_and_operators() {
+        // The point of remapping at the key level: everything downstream keeps
+        // working without knowing a map exists.
+        let mut app = app_with_keys("a\nb\nc\nd\ne", &[("t", "j")]);
+        keys(&mut app, "3t");
+        assert_eq!(app.cursor.row, 3, "a count applies to the rebound motion");
+
+        let mut app = app_with_keys("uno dos tres", &[("e", "w")]);
+        keys(&mut app, "de");
+        assert_eq!(app.document.buffer.line(0), Some("dos tres"), "d + rebound motion");
+    }
+
+    #[test]
+    fn remapping_does_not_reach_insert_mode() {
+        // Otherwise the file gets the keymap instead of the text.
+        let mut app = app_with_keys("", &[("t", "j")]);
+        press(&mut app, KeyCode::Char('i'));
+        keys(&mut app, "text");
+        assert_eq!(app.document.buffer.line(0), Some("text"));
+    }
+
+    #[test]
+    fn remapping_does_not_reach_command_or_search() {
+        // `:wq` has to stay spellable for someone who rebound `w`.
+        let mut app = app_with_keys("hello", &[("w", "j"), ("q", "k")]);
+        press(&mut app, KeyCode::Char(':'));
+        keys(&mut app, "info");
+        assert_eq!(app.command, "info");
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('/'));
+        keys(&mut app, "ell");
+        assert_eq!(app.search, "ell");
+    }
+
+    #[test]
+    fn remapping_works_in_visual_mode_where_keys_are_commands() {
+        let mut app = app_with_keys("uno\ndos\ntres", &[("t", "j")]);
+        keys(&mut app, "vt");
+        assert_eq!(app.selection(), Some(((0, 0), (1, 0))));
+    }
+
+    #[test]
+    fn an_unbound_editor_behaves_exactly_as_before() {
+        let mut app = app_with_keys("a\nb\nc", &[]);
+        keys(&mut app, "jj");
+        assert_eq!(app.cursor.row, 2);
+    }
+
+    #[test]
+    fn a_swapped_pair_does_what_it_looks_like() {
+        let mut app = app_with_keys("a\nb\nc", &[("j", "k"), ("k", "j")]);
+        keys(&mut app, "k"); // acts as j
+        assert_eq!(app.cursor.row, 1);
+        keys(&mut app, "j"); // acts as k
+        assert_eq!(app.cursor.row, 0);
     }
 
     // ── Crash recovery ──────────────────────────────────────────

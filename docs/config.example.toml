@@ -45,3 +45,32 @@ clipboard = false
 
 # Undo snapshots kept in memory.
 historylimit = 512
+
+[keys]
+
+# Rebind keys, as `pressed = "acts as"`. maat rewrites the key before anything
+# else looks at it, so a rebound key composes with everything for free: counts,
+# operators, visual mode and the two-stroke sequences all keep working.
+#
+# The trade is that you bind a key to another *key*, not to a command name.
+# `t = "j"` works; `t = "delete_line"` does not — write `t = "d"` and press it
+# twice, exactly as you would have pressed `dd`.
+#
+# Case matters for characters, because `g` and `G` are different commands.
+# Named keys are not case-sensitive: Space, Enter, Esc, Tab, Backspace, Left,
+# Right, Up, Down, Home, End.
+#
+# Bindings apply only where a key is a command — Normal and Visual. In Insert,
+# Command and Search a key is text, so `:wq` stays spellable after rebinding
+# `w`, and typing does not produce the keymap instead of your words.
+#
+# Dvorak, where hjkl is not a home row:
+# t = "j"
+# n = "k"
+# h = "h"
+# s = "l"
+#
+# A key can be swapped with another; resolution never chains, so this does
+# what it looks like rather than collapsing:
+# j = "k"
+# k = "j"

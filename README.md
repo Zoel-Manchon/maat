@@ -386,8 +386,8 @@ pull requests. Formatting and Clippy remain recommended local pre-commit checks.
 - [x] Recovery journal: `:recover` / `:discard` after an interrupted session.
 - [x] Release binaries for Linux (musl and gnu), macOS and Windows, with
       `SHA256SUMS`. Code signing still needs certificates this project has not.
-- [ ] Configurable **key map** — the theme and editor options are configurable
-      today, rebinding keys is not.
+- [x] Configurable **key map** — a `[keys]` table rebinds any key to any other,
+      applied before dispatch so counts, operators and visual mode keep working.
 - [ ] Syntax highlighting with language detection.
 - [ ] Tabs, multiple buffers and a file picker.
 - [ ] Rope or piece-table storage for large files.
