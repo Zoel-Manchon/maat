@@ -19,6 +19,7 @@
 | **Built with** | Rust · `ratatui` · `crossterm` · `sha2` — four crates, on purpose |
 | **Size** | ~6 300 lines · **188 tests** · a 906 KB static musl binary |
 | **Editing** | Modal (Normal / Insert / Command / Search / Visual) · counts · operators composed with motions · literal `:s` substitution · undo & redo · multiple buffers with a file picker |
+| **Reading** | Syntax highlighting for the six file types you meet on a server, from hand-written lexers — no grammar library, no extra dependency |
 | **Integrity** | Atomic saves · external-change detection · crash-recovery journal · audit events in JSON or CEF · `--verify` for scripts |
 | **Made for** | Appliance consoles, shared servers and config files — anywhere a blind overwrite destroys someone else's change, or an attacker's tracks |
 | **Run it** | `cargo run -- notes.txt` |
@@ -262,6 +263,8 @@ The destination directory must already exist.
 | `:discard` | Throw that journal away |
 | `:set relativenumber` | Enable relative line numbers |
 | `:set number` | Restore absolute line numbers |
+| `:set syntax` | Re-detect the language for this buffer |
+| `:set nosyntax` | Turn highlighting off for this buffer |
 | `:set clipboard` | Mirror yanks to the terminal clipboard (OSC 52) |
 | `:set noclipboard` | Keep yanks in the editor's register only |
 | `:help` | Open the quick reference |
@@ -282,6 +285,9 @@ The destination directory must already exist.
 - CRLF and LF line endings preserved exactly as the file had them.
 - Bracketed paste: a pasted block is inserted as text, never run as commands.
 - System clipboard over **OSC 52** — works through SSH, needs no display server.
+- **Syntax highlighting** for Rust, TOML, shell, JSON, Markdown and INI-style
+  config, detected from the file name or the shebang — resumable line by line,
+  so a block comment opened 500 lines up still colours what is on screen.
 - **Multiple buffers** with per-buffer cursor, scroll and undo history.
 - **File picker** (`Ctrl-p`) and buffer picker, filtered by substring as you type.
 - External-change detection before save; explicit `:w!` override.
@@ -558,7 +564,7 @@ and `ffmpeg` on the PATH.
       `SHA256SUMS`. Code signing still needs certificates this project has not.
 - [x] Configurable **key map** — a `[keys]` table rebinds any key to any other,
       applied before dispatch so counts, operators and visual mode keep working.
-- [ ] Syntax highlighting with language detection.
+- [x] Syntax highlighting with language detection, incremental line by line.
 - [x] Multiple buffers and a file picker (`:e`, `:bn`, `:bd`, `Ctrl-p`).
 - [ ] Rope or piece-table storage for large files.
 

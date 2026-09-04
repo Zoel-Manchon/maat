@@ -15,6 +15,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::core::mode::Mode;
+use crate::core::syntax::TokenKind;
 use crate::ui::app::{App, Level};
 use crate::ui::theme;
 
@@ -60,11 +61,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_buffer(frame: &mut Frame, area: Rect, app: &App, gutter: u16) {
+fn draw_buffer(frame: &mut Frame, area: Rect, app: &mut App, gutter: u16) {
     let height = area.height as usize;
     let width = area.width.saturating_sub(gutter) as usize;
     let total = app.document.buffer.line_count();
-    let query = app.active_search();
+    // Owned up front: `tokens` needs `&mut` on the highlighter while the loop
+    // reads the rest of `app`, and the query is a handful of characters.
+    let query = app.active_search().to_string();
+    // Same reason — the highlighter is taken out for the duration of the loop
+    // and put back at the end, so the borrow checker sees two disjoint fields
+    // instead of one overlapping borrow.
+    let mut highlighter = std::mem::replace(
+        &mut app.highlighter,
+        crate::core::syntax::Highlighter::new(crate::core::syntax::Language::PlainText),
+    );
 
     let mut lines: Vec<Line> = Vec::with_capacity(height);
 
@@ -130,8 +140,19 @@ fn draw_buffer(frame: &mut Frame, area: Rect, app: &App, gutter: u16) {
             (to > from).then_some((from, to))
         });
 
+        // Syntax first, then search, then selection — in that order, because
+        // each is more urgent than the one before it. The selection is what
+        // the next keystroke acts on, so nothing may hide it.
+        let tokens = highlighter.tokens(&app.document.buffer, row);
         let mut spans = vec![Span::styled(number, number_style)];
-        spans.extend(highlight_line(content, query, content_style, selection));
+        spans.extend(style_line(
+            &content,
+            content_style,
+            &tokens,
+            app.offset_col,
+            &query,
+            selection,
+        ));
         spans.push(Span::styled(
             " ".repeat(width.saturating_sub(content_len)),
             content_style,
@@ -139,54 +160,88 @@ fn draw_buffer(frame: &mut Frame, area: Rect, app: &App, gutter: u16) {
         lines.push(Line::from(spans));
     }
 
+    app.highlighter = highlighter;
     frame.render_widget(Paragraph::new(lines).style(theme::text()), area);
 }
 
-/// One rendered line: the visual selection wins over search highlighting where
-/// the two overlap, because the selection is what the next keystroke acts on.
-/// `selection` is a `[from, to)` character range within `text`.
-fn highlight_line(
-    text: String,
-    query: &str,
+/// Styles one visible line by painting three layers onto a per-character
+/// buffer, then coalescing equal neighbours into spans.
+///
+/// Nesting the three passes as functions — syntax calling search calling
+/// selection — is where this kind of code usually ends up, and it goes wrong
+/// the moment two of them overlap on the same character: whichever ran first
+/// has already cut the string, and the second cannot reach inside it. Painting
+/// per character makes the precedence explicit and the overlaps trivial.
+///
+/// `text` is the slice already on screen; `offset` is the column it starts at,
+/// which is what maps the token ranges (whole-line) onto it.
+fn style_line(
+    text: &str,
     base: Style,
+    tokens: &[crate::core::syntax::Token],
+    offset: usize,
+    query: &str,
     selection: Option<(usize, usize)>,
 ) -> Vec<Span<'static>> {
-    let Some((from, to)) = selection else {
-        return highlight_matches(text, query, base);
-    };
-
     let chars: Vec<char> = text.chars().collect();
-    let from = from.min(chars.len());
-    let to = to.min(chars.len()).max(from);
-
-    let head: String = chars[..from].iter().collect();
-    let selected: String = chars[from..to].iter().collect();
-    let tail: String = chars[to..].iter().collect();
-
-    let mut spans = highlight_matches(head, query, base);
-    if !selected.is_empty() {
-        spans.push(Span::styled(selected, theme::selection()));
+    if chars.is_empty() {
+        return Vec::new();
     }
-    spans.extend(highlight_matches(tail, query, base));
-    spans
-}
+    let mut styles = vec![base; chars.len()];
 
-fn highlight_matches(text: String, query: &str, base: Style) -> Vec<Span<'static>> {
-    if query.is_empty() || !text.contains(query) {
-        return vec![Span::styled(text, base)];
-    }
-
-    let mut spans = Vec::new();
-    let mut start = 0;
-    for (byte, matched) in text.match_indices(query) {
-        if byte > start {
-            spans.push(Span::styled(text[start..byte].to_string(), base));
+    // 1. Syntax, shifted from line coordinates into the visible window.
+    for token in tokens {
+        let style = match token.kind {
+            TokenKind::Keyword => theme::syntax_keyword(),
+            TokenKind::Str => theme::syntax_string(),
+            TokenKind::Comment => theme::syntax_comment(),
+            TokenKind::Number => theme::syntax_number(),
+        };
+        // Keep the line background (the current-line highlight) and change
+        // only the foreground, or a token would punch a hole in it.
+        let style = match base.bg {
+            Some(bg) => style.bg(bg),
+            None => style,
+        };
+        let from = token.start.saturating_sub(offset);
+        let to = token.end.saturating_sub(offset);
+        for slot in styles.iter_mut().take(to.min(chars.len())).skip(from) {
+            *slot = style;
         }
-        spans.push(Span::styled(matched.to_string(), theme::search_match()));
-        start = byte + matched.len();
     }
-    if start < text.len() {
-        spans.push(Span::styled(text[start..].to_string(), base));
+
+    // 2. Search matches.
+    if !query.is_empty() {
+        let query_len = query.chars().count();
+        for (byte, matched) in text.match_indices(query) {
+            let start = text[..byte].chars().count();
+            for slot in styles.iter_mut().skip(start).take(matched.chars().count().max(query_len)) {
+                *slot = theme::search_match();
+            }
+        }
+    }
+
+    // 3. The selection, which nothing may hide.
+    if let Some((from, to)) = selection {
+        for slot in styles.iter_mut().take(to.min(chars.len())).skip(from.min(chars.len())) {
+            *slot = theme::selection();
+        }
+    }
+
+    // Coalesce: one span per run of equal style, so the terminal is not asked
+    // to draw a span per character.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_style = styles[0];
+    for (index, ch) in chars.iter().enumerate() {
+        if styles[index] != run_style {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style));
+            run_style = styles[index];
+        }
+        run.push(*ch);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style));
     }
     spans
 }
@@ -375,7 +430,7 @@ fn draw_message(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// The key guide, as section/keys pairs. An empty section opens a free line.
-const HELP_ROWS: [(&str, &str); 18] = [
+const HELP_ROWS: [(&str, &str); 19] = [
     ("MOVEMENT", "h j k l · w b · 0 $ · gg G · 12G"),
     ("COUNTS", "3j · 5x · 2dd · 3p — before any of the above"),
     ("INSERT", "i a I A · o O · Esc"),
@@ -391,6 +446,7 @@ const HELP_ROWS: [(&str, &str); 18] = [
     ("INTEGRITY", ":hash · :check · :info"),
     ("RECOVERY", ":recover · :discard"),
     ("DISPLAY", ":set relativenumber · :set number"),
+    ("SYNTAX", "detected from the file · :set syntax · :set nosyntax"),
     ("", ""),
     ("CONFIG", "~/.config/maat/config.toml · [keys] rebinds"),
     ("CLOSE", "Esc · ? · q"),
@@ -547,6 +603,7 @@ mod tests {
     use super::*;
     use crate::core::document::Document;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
     use ratatui::Terminal;
 
     /// Renders `app` on an 80x25 console — the size of the Linux VGA text
@@ -564,6 +621,61 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The foreground colour of every cell on one rendered row.
+    fn row_colours(app: &mut App, width: u16, height: u16, row: u16) -> Vec<(char, Color)> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..width)
+            .map(|x| {
+                let cell = buffer.cell((x, row)).unwrap();
+                (cell.symbol().chars().next().unwrap_or(' '), cell.fg)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_rust_file_is_coloured_on_screen() {
+        // The end-to-end check: a real document, through the real draw path,
+        // read back off the rendered cells.
+        let mut app = App::new(Document::from_text_for_test(
+            "let x = 42; // note\n",
+        ));
+        app.set_language_for_test(crate::core::syntax::Language::Rust);
+
+        let cells = row_colours(&mut app, 80, 25, 0);
+        let text: String = cells.iter().map(|(ch, _)| *ch).collect();
+        // Character index, not byte: the gutter's `│` is three bytes wide, and
+        // `str::find` would put every lookup after it three cells to the left.
+        let at = |needle: &str| {
+            let byte = text.find(needle).expect("present on the row");
+            text[..byte].chars().count()
+        };
+
+        let keyword = cells[at("let")].1;
+        let number = cells[at("42")].1;
+        let comment = cells[at("// note")].1;
+        let plain = cells[at(" x ") + 1].1;
+
+        assert_eq!(Some(keyword), theme::syntax_keyword().fg, "`let` is a keyword");
+        assert_eq!(Some(number), theme::syntax_number().fg, "`42` is a number");
+        assert_eq!(Some(comment), theme::syntax_comment().fg, "the trailing comment");
+        assert_ne!(plain, keyword, "ordinary text is not coloured as a keyword");
+    }
+
+    #[test]
+    fn an_unknown_file_type_renders_in_one_colour() {
+        let mut app = App::new(Document::from_text_for_test("let x = 42; // note\n"));
+        // PlainText is the default for a buffer with no path.
+        let cells = row_colours(&mut app, 80, 25, 0);
+        let text: String = cells.iter().map(|(ch, _)| *ch).collect();
+        let start = text[..text.find("let").unwrap()].chars().count();
+
+        let colours: std::collections::HashSet<_> =
+            cells[start..start + 19].iter().map(|(_, fg)| *fg).collect();
+        assert_eq!(colours.len(), 1, "no highlighting without a known language");
     }
 
     /// Row indices of the frame that carry any ink.
@@ -671,10 +783,81 @@ mod tests {
         assert_eq!(gutter_width(12345), 8);
     }
 
+    /// The property every styling layer has to keep: colours change, the text
+    /// on screen does not.
+    fn styled_text(
+        text: &str,
+        tokens: &[crate::core::syntax::Token],
+        query: &str,
+        selection: Option<(usize, usize)>,
+    ) -> String {
+        style_line(text, theme::text(), tokens, 0, query, selection)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
     #[test]
     fn search_highlighting_preserves_text() {
-        let spans = highlight_matches("one two one".to_string(), "one", theme::text());
-        let joined: String = spans.iter().map(|span| span.content.as_ref()).collect();
-        assert_eq!(joined, "one two one");
+        assert_eq!(styled_text("one two one", &[], "one", None), "one two one");
+    }
+
+    #[test]
+    fn every_layer_preserves_the_text_it_colours() {
+        use crate::core::syntax::{Language, LineState};
+        let line = r#"let x = "one"; // one"#;
+        let tokens = Language::Rust.lex(line, LineState::Normal).0;
+
+        assert_eq!(styled_text(line, &tokens, "", None), line, "syntax alone");
+        assert_eq!(styled_text(line, &tokens, "one", None), line, "syntax + search");
+        assert_eq!(
+            styled_text(line, &tokens, "one", Some((4, 9))),
+            line,
+            "syntax + search + selection, all overlapping"
+        );
+    }
+
+    #[test]
+    fn the_selection_wins_over_the_layers_beneath_it() {
+        use crate::core::syntax::{Language, LineState};
+        let line = "let x = 1;";
+        let tokens = Language::Rust.lex(line, LineState::Normal).0;
+
+        // `let` is a keyword and also inside the selection: it must be drawn
+        // as selected, because that is what the next keystroke acts on.
+        let spans = style_line(line, theme::text(), &tokens, 0, "", Some((0, 3)));
+        assert_eq!(spans[0].style, theme::selection());
+        assert_eq!(spans[0].content.as_ref(), "let");
+    }
+
+    #[test]
+    fn a_token_keeps_the_line_background_under_it() {
+        use crate::core::syntax::{Language, LineState};
+        let line = "let x = 1;";
+        let tokens = Language::Rust.lex(line, LineState::Normal).0;
+
+        // On the cursor's line the background is the current-line highlight;
+        // a keyword must not punch a hole in it.
+        let spans = style_line(line, theme::current_line(), &tokens, 0, "", None);
+        assert_eq!(spans[0].style.bg, theme::current_line().bg);
+        assert_eq!(spans[0].style.fg, theme::syntax_keyword().fg);
+    }
+
+    #[test]
+    fn an_empty_line_produces_no_spans() {
+        assert!(style_line("", theme::text(), &[], 0, "", None).is_empty());
+    }
+
+    #[test]
+    fn a_horizontally_scrolled_line_shifts_the_tokens_with_it() {
+        use crate::core::syntax::{Language, LineState};
+        let line = "let value = 12345;";
+        let tokens = Language::Rust.lex(line, LineState::Normal).0;
+
+        // Show the line from column 12: the number starts at 12, so the very
+        // first character on screen must already be coloured as one.
+        let visible: String = line.chars().skip(12).collect();
+        let spans = style_line(&visible, theme::text(), &tokens, 12, "", None);
+        assert_eq!(spans[0].style.fg, theme::syntax_number().fg);
     }
 }

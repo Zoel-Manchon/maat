@@ -16,6 +16,7 @@ use crate::core::journal::Journal;
 use crate::core::cursor::Cursor;
 use crate::core::document::{DiskState, Document};
 use crate::core::mode::Mode;
+use crate::core::syntax::{Highlighter, Language};
 use crate::ui::keymap::KeyMap;
 
 /// Edits between journal writes. Small enough that a crash costs a sentence,
@@ -216,6 +217,14 @@ fn char_span(
     (from <= to).then_some((from, to))
 }
 
+/// The language for a buffer, from its path and its first line.
+///
+/// Takes the pair rather than the `Document` so it can be called while the
+/// document is being moved into the struct.
+fn detect_language(from: &(Option<PathBuf>, String)) -> Language {
+    Language::detect(from.0.as_deref(), &from.1)
+}
+
 /// "1 line yanked" / "3 lines yanked" — singular and plural, so the status bar
 /// never reads like a placeholder.
 fn count_message(lines: usize, what: &str) -> String {
@@ -410,6 +419,10 @@ pub struct App {
     current: usize,
     /// The file picker overlay, when open.
     pub picker: Option<Picker>,
+    /// Syntax highlighting for the current buffer, with its own line-state
+    /// cache. Rebuilt on every buffer switch, because the language is a
+    /// property of the file and not of the editor.
+    pub highlighter: Highlighter,
     pub quit: bool,
     /// True when the session ended via `:q!` with unsaved changes on the table.
     /// `visudo` and friends rely on a non-zero exit to know the edit was
@@ -430,6 +443,11 @@ impl App {
 
     pub fn with_config(document: Document, config: Config) -> Self {
         let hash_cache = document.buffer_hash();
+        // Read before `document` is moved into the struct.
+        let document_for_language = (
+            document.path().map(|p| p.to_path_buf()),
+            document.buffer.line(0).unwrap_or("").to_string(),
+        );
         Self {
             document,
             cursor: Cursor::default(),
@@ -461,6 +479,7 @@ impl App {
             slots: vec![None],
             current: 0,
             picker: None,
+            highlighter: Highlighter::new(detect_language(&document_for_language)),
             // The environment wins over the file: it is the thing someone
             // sets for one session, on a box whose config they cannot edit.
             clipboard: std::env::var("MAAT_CLIPBOARD")
@@ -558,10 +577,25 @@ impl App {
     fn after_edit(&mut self) {
         self.cursor.clamp(&self.document.buffer, self.mode);
         self.hash_cache = self.document.buffer_hash();
+        // One line back, because a join or a delete makes the line above the
+        // cursor the first one whose lexer state can have changed.
+        self.highlighter.invalidate_from(self.cursor.row.saturating_sub(1));
         self.edits_since_journal += 1;
         if self.edits_since_journal >= JOURNAL_EVERY {
             self.write_journal();
         }
+    }
+
+    // ── Syntax ──────────────────────────────────────────────────
+
+    /// Re-detects the language for whatever buffer is now current and throws
+    /// the line-state cache away, since it described a different file.
+    fn refresh_language(&mut self) {
+        let language = detect_language(&(
+            self.document.path().map(|p| p.to_path_buf()),
+            self.document.buffer.line(0).unwrap_or("").to_string(),
+        ));
+        self.highlighter.set_language(language);
     }
 
     // ── Buffers ─────────────────────────────────────────────────
@@ -617,6 +651,7 @@ impl App {
         self.slots[self.current] = Some(outgoing);
         self.restore(target);
         self.current = index;
+        self.refresh_language();
 
         // Leaving a mode half-entered in one buffer and arriving in another
         // with it still pending is the kind of state nobody can reason about.
@@ -680,6 +715,7 @@ impl App {
 
                 self.slots.push(None);
                 self.current = self.slots.len() - 1;
+                self.refresh_language();
 
                 // A file opened here deserves the same recovery check as one
                 // opened on the command line.
@@ -734,6 +770,7 @@ impl App {
         let Some(target) = self.slots[next].take() else { return };
         self.restore(target);
         self.current = next;
+        self.refresh_language();
         self.mode = Mode::Normal;
         self.cursor.clamp(&self.document.buffer, self.mode);
         self.announce_buffer();
@@ -887,6 +924,13 @@ impl App {
         let _ = journal.write(path, &self.document.to_disk_text(), self.document.disk_hash());
     }
 
+    /// Forces a language, so a buffer with no path on disk can still be
+    /// rendered with highlighting in a test.
+    #[cfg(test)]
+    pub fn set_language_for_test(&mut self, language: Language) {
+        self.highlighter.set_language(language);
+    }
+
     /// Points the journal at a scratch directory, so recovery can be tested
     /// without touching the real state directory.
     #[cfg(test)]
@@ -1002,6 +1046,7 @@ impl App {
     }
 
     fn undo(&mut self) {
+        self.highlighter.invalidate_from(0);
         let Some(previous) = self.undo_stack.pop_back() else {
             self.notify("nothing to undo", Level::Info);
             return;
@@ -1016,6 +1061,7 @@ impl App {
     }
 
     fn redo(&mut self) {
+        self.highlighter.invalidate_from(0);
         let Some(next) = self.redo_stack.pop_back() else {
             self.notify("nothing to redo", Level::Info);
             return;
@@ -1989,6 +2035,15 @@ impl App {
                 self.relative_numbers = false;
                 self.notify("absolute line numbers on", Level::Info);
             }
+            "set nosyntax" => {
+                self.highlighter.set_language(Language::PlainText);
+                self.notify("syntax highlighting off", Level::Info);
+            }
+            "set syntax" => {
+                self.refresh_language();
+                let label = self.highlighter.language().label();
+                self.notify(format!("syntax: {label} (detected)"), Level::Info);
+            }
             "set clipboard" => {
                 self.clipboard = true;
                 self.notify("yanks now go to the terminal clipboard (OSC 52)", Level::Info);
@@ -2082,8 +2137,9 @@ impl App {
             .unwrap_or_else(|| "[sin ruta]".to_string());
         self.notify(
             format!(
-                "{path} · {lines} lines · {words} words · {chars} chars · {}",
-                self.document.line_ending().label()
+                "{path} · {lines} lines · {words} words · {chars} chars · {} · {}",
+                self.document.line_ending().label(),
+                self.highlighter.language().label()
             ),
             Level::Info,
         );

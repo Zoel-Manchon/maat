@@ -168,10 +168,24 @@ whole document after every keystroke.
   of lines, and the change only pays off alongside the operation-based history
   in priority 2 and lazy hashing. Doing it before those two would mean doing it
   twice.
-- Incremental syntax highlighting. **Still open.** Needs a lexer per language
-  and a dirty-range model in the renderer; the current `highlight_line` splits
-  a line by one literal query, which is the right shape for search and the
-  wrong one for a grammar.
+- [x] Incremental syntax highlighting. Hand-written lexers for Rust, TOML,
+      shell, JSON, Markdown and INI-style config, detected from the file name
+      or the shebang. `syntect` carries Sublime grammars and a regex engine and
+      `tree-sitter` compiles a parser per language from C; either is right for
+      an editor that highlights anything, and neither fits a four-crate binary
+      that ships inside an appliance image.
+
+      Each lexer is a function from `(state entering the line, the line)` to
+      `(tokens, state leaving it)`, which is what makes it resumable: the
+      highlighter caches the state entering every line, so drawing a window
+      costs the lines in it, an edit invalidates from that line down, and a
+      block comment opened 500 lines above still colours what is on screen.
+
+      The renderer stopped nesting its passes and now paints syntax, search and
+      selection onto a per-character style buffer before coalescing runs into
+      spans. Nesting breaks the moment two layers overlap on one character —
+      the first has already cut the string and the second cannot reach inside
+      it.
 - [x] Recovery journal. Unsaved work is mirrored to
       `$XDG_STATE_HOME/maat/swap` every twenty edits and on a clean quit, and
       deleted the moment it is on disk — so a journal that outlives its session

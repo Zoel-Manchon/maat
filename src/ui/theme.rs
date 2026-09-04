@@ -202,6 +202,30 @@ pub fn welcome_dim() -> Style {
     Style::default().fg(dim()).bg(bg())
 }
 
+// ── Syntax ──────────────────────────────────────────────────────
+// Five token classes, drawn from the same Oxblood palette rather than a second
+// one bolted on: rose for keywords, gold for strings, faint wine for comments,
+// hash-pink for numbers. On a 16-colour console each falls back to a distinct
+// ANSI colour, which is the only place the distinction has to survive.
+
+pub fn syntax_keyword() -> Style {
+    Style::default().fg(rose()).add_modifier(Modifier::BOLD)
+}
+
+pub fn syntax_string() -> Style {
+    Style::default().fg(gold())
+}
+
+/// Deliberately dim. A comment you cannot read past is a comment that fights
+/// the code it explains.
+pub fn syntax_comment() -> Style {
+    Style::default().fg(dim()).add_modifier(Modifier::ITALIC)
+}
+
+pub fn syntax_number() -> Style {
+    Style::default().fg(hash_colour())
+}
+
 pub fn overlay() -> Style {
     Style::default().fg(fg()).bg(bg_overlay())
 }

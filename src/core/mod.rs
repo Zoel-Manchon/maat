@@ -9,3 +9,4 @@ pub mod cursor;
 pub mod document;
 pub mod journal;
 pub mod mode;
+pub mod syntax;
