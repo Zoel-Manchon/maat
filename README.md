@@ -77,7 +77,7 @@ flowchart TB
 
 | Module | Responsibility | Lines |
 | --- | --- | --- |
-| `core/buffer` | Lines of text, addressed in **characters** — slicing `café` by byte is how an editor corrupts a file | 354 |
+| `core/buffer` | A line-oriented **piece table**: every line is a range into the file as read, or into an append buffer. Addressed in **characters** — slicing `café` by byte is how an editor corrupts a file | 430 |
 | `core/cursor` | Every motion clamps against the buffer, so an out-of-range cursor is unrepresentable | 139 |
 | `core/mode` | The five modes as an enum, so the compiler forces every input state to be handled | 72 |
 | `core/document` | Atomic writes, SHA-256 disk state, CRLF/LF preservation | 515 |
@@ -566,7 +566,7 @@ and `ffmpeg` on the PATH.
       applied before dispatch so counts, operators and visual mode keep working.
 - [x] Syntax highlighting with language detection, incremental line by line.
 - [x] Multiple buffers and a file picker (`:e`, `:bn`, `:bd`, `Ctrl-p`).
-- [ ] Rope or piece-table storage for large files.
+- [x] Piece-table storage: opening and undo no longer copy the file.
 
 See [`docs/project-review.md`](docs/project-review.md) for the technical review
 and design priorities.

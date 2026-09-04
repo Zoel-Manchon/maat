@@ -163,11 +163,23 @@ whole document after every keystroke.
 
 ### 0.5
 
-- Rope or piece table. **Still open**, and the honest reason is that it is a
-  rewrite rather than an addition: `Vec<String>` is fine to tens of thousands
-  of lines, and the change only pays off alongside the operation-based history
-  in priority 2 and lazy hashing. Doing it before those two would mean doing it
-  twice.
+- [x] Piece table. A line-oriented one: every line is a `(source, byte range)`
+      pair into either the file as it was read or an append buffer.
+
+      The textbook design stores spans of the whole document, and then
+      `line(row)` cannot return a `&str` — a line may straddle two pieces —
+      which would turn a borrow into an allocation per line per frame in the
+      renderer and move 150-odd call sites. One piece per line keeps the borrow
+      and the API, at the cost of rewriting an edited line rather than
+      splitting a piece. A line is small.
+
+      Measured on the same machine against the `Vec<String>` it replaced, on a
+      200 000-line file: opening 11.85 ms to 7.92 ms, a hundred undo snapshots
+      1.26 s to 199 ms, and a thousand keystrokes 11.85 us to 27.24 us. The
+      snapshot column is the one that matters, because it happens on every
+      edit. The keystroke column got 2.3x worse and is reported anyway — at 27
+      nanoseconds each, that is the reason it is an acceptable trade and not a
+      reason to hide it.
 - [x] Incremental syntax highlighting. Hand-written lexers for Rust, TOML,
       shell, JSON, Markdown and INI-style config, detected from the file name
       or the shebang. `syntect` carries Sublime grammars and a regex engine and
