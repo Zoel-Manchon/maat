@@ -6,7 +6,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::core::audit::{self, SaveEvent};
 use crate::core::buffer::Buffer;
@@ -243,6 +243,107 @@ fn substitute_line(line: &str, rule: &Substitution) -> (String, usize) {
     }
 }
 
+/// The file picker overlay: a list, a filter, and a highlighted row.
+///
+/// Deliberately not a fuzzy matcher. On the box this editor is for you are
+/// looking for `sshd_config`, and a substring match finds it; a fuzzy score
+/// would also offer four files you did not mean, ranked by an algorithm you
+/// cannot see. What you typed is what it looks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picker {
+    /// What the picker offers, before filtering.
+    entries: Vec<PickerEntry>,
+    /// The substring typed so far.
+    pub query: String,
+    /// Index into the *filtered* list.
+    pub selected: usize,
+    pub title: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerEntry {
+    /// What the user sees.
+    pub label: String,
+    /// What choosing it does.
+    action: PickerAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PickerAction {
+    /// Switch to an already-open buffer.
+    Buffer(usize),
+    /// Open a path from disk.
+    Open(PathBuf),
+}
+
+impl Picker {
+    /// How many entries the picker was built with, before filtering.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The entries matching the query, with their index in `entries`.
+    pub fn matches(&self) -> Vec<(usize, &PickerEntry)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                self.query.is_empty()
+                    || entry.label.to_lowercase().contains(&self.query.to_lowercase())
+            })
+            .collect()
+    }
+
+    /// Keeps the highlighted row inside the filtered list; typing narrows it
+    /// and the selection must not point past the end.
+    fn clamp(&mut self) {
+        let count = self.matches().len();
+        if count == 0 {
+            self.selected = 0;
+        } else if self.selected >= count {
+            self.selected = count - 1;
+        }
+    }
+
+    fn move_by(&mut self, delta: isize) {
+        let count = self.matches().len();
+        if count == 0 {
+            return;
+        }
+        // Wraps, so holding the key never stalls at an edge.
+        let next = (self.selected as isize + delta).rem_euclid(count as isize);
+        self.selected = next as usize;
+    }
+
+    fn chosen(&self) -> Option<PickerAction> {
+        self.matches()
+            .get(self.selected)
+            .map(|(_, entry)| entry.action.clone())
+    }
+}
+
+/// Everything that belongs to one open file rather than to the editor.
+///
+/// The live buffer's state stays in `App`'s own fields — every motion, edit
+/// and render already reaches for `self.document` and `self.cursor`, and
+/// routing all of that through an index would touch a thousand lines to change
+/// nothing observable. Switching instead swaps the whole set in and out.
+///
+/// The invariant that makes it safe is small enough to state in one line and
+/// is asserted in the tests: **exactly one slot is `None`, and it is the
+/// current one** — because that buffer is not stashed, it is live.
+#[derive(Debug)]
+struct StashedBuffer {
+    document: Document,
+    cursor: Cursor,
+    offset_row: usize,
+    offset_col: usize,
+    undo_stack: VecDeque<Snapshot>,
+    redo_stack: VecDeque<Snapshot>,
+    hash_cache: String,
+    edits_since_journal: usize,
+}
+
 pub struct App {
     pub document: Document,
     pub cursor: Cursor,
@@ -302,6 +403,13 @@ pub struct App {
     /// A journal from a previous session, waiting for `:recover` or
     /// `:discard`. Kept here so the message line can keep mentioning it.
     pub pending_recovery: bool,
+    /// Every open file. The current one's slot is `None` because its state is
+    /// live in the fields above; every other slot holds a stashed buffer.
+    slots: Vec<Option<StashedBuffer>>,
+    /// Index into `slots` of the buffer currently being edited.
+    current: usize,
+    /// The file picker overlay, when open.
+    pub picker: Option<Picker>,
     pub quit: bool,
     /// True when the session ended via `:q!` with unsaved changes on the table.
     /// `visudo` and friends rely on a non-zero exit to know the edit was
@@ -350,6 +458,9 @@ impl App {
             journal: Journal::discover(),
             edits_since_journal: 0,
             pending_recovery: false,
+            slots: vec![None],
+            current: 0,
+            picker: None,
             // The environment wins over the file: it is the thing someone
             // sets for one session, on a box whose config they cannot edit.
             clipboard: std::env::var("MAAT_CLIPBOARD")
@@ -450,6 +561,307 @@ impl App {
         self.edits_since_journal += 1;
         if self.edits_since_journal >= JOURNAL_EVERY {
             self.write_journal();
+        }
+    }
+
+    // ── Buffers ─────────────────────────────────────────────────
+
+    /// How many files are open.
+    pub fn buffer_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Which one is being edited, counted from one for display.
+    pub fn buffer_index(&self) -> usize {
+        self.current + 1
+    }
+
+    /// Lifts the live state out of the fields so another buffer can take them.
+    fn stash(&mut self) -> StashedBuffer {
+        StashedBuffer {
+            document: std::mem::take(&mut self.document),
+            cursor: self.cursor,
+            offset_row: self.offset_row,
+            offset_col: self.offset_col,
+            undo_stack: std::mem::take(&mut self.undo_stack),
+            redo_stack: std::mem::take(&mut self.redo_stack),
+            hash_cache: std::mem::take(&mut self.hash_cache),
+            edits_since_journal: self.edits_since_journal,
+        }
+    }
+
+    fn restore(&mut self, stashed: StashedBuffer) {
+        self.document = stashed.document;
+        self.cursor = stashed.cursor;
+        self.offset_row = stashed.offset_row;
+        self.offset_col = stashed.offset_col;
+        self.undo_stack = stashed.undo_stack;
+        self.redo_stack = stashed.redo_stack;
+        self.hash_cache = stashed.hash_cache;
+        self.edits_since_journal = stashed.edits_since_journal;
+    }
+
+    /// Switches to another open buffer.
+    ///
+    /// The journal is flushed on the way out: an unsaved buffer left in the
+    /// background must still be recoverable if the editor dies while you are
+    /// somewhere else.
+    fn switch_to_buffer(&mut self, index: usize) {
+        if index == self.current || index >= self.slots.len() {
+            return;
+        }
+        self.write_journal();
+
+        let Some(target) = self.slots[index].take() else { return };
+        let outgoing = self.stash();
+        self.slots[self.current] = Some(outgoing);
+        self.restore(target);
+        self.current = index;
+
+        // Leaving a mode half-entered in one buffer and arriving in another
+        // with it still pending is the kind of state nobody can reason about.
+        self.mode = Mode::Normal;
+        self.pending = None;
+        self.count = None;
+        self.cursor.clamp(&self.document.buffer, self.mode);
+        self.announce_buffer();
+    }
+
+    fn announce_buffer(&mut self) {
+        let name = self.document.name();
+        let index = self.buffer_index();
+        let total = self.buffer_count();
+        let modified = if self.is_modified() { " [+]" } else { "" };
+        self.notify(format!("[{index}/{total}] {name}{modified}"), Level::Info);
+    }
+
+    /// Index, display name and modified flag for every open buffer.
+    fn open_buffers(&self) -> Vec<(usize, String, bool)> {
+        (0..self.slots.len())
+            .map(|index| {
+                if index == self.current {
+                    // The live buffer is not in `slots`; describe it from the
+                    // fields rather than stashing just to read a name.
+                    (index, self.document.name(), self.is_modified())
+                } else {
+                    let slot = self.slots[index].as_ref();
+                    let name = slot.map(|s| s.document.name()).unwrap_or_default();
+                    let modified = slot
+                        .map(|s| s.document.is_hash_modified(&s.hash_cache))
+                        .unwrap_or(false);
+                    (index, name, modified)
+                }
+            })
+            .collect()
+    }
+
+    /// `:e <path>` — open a file, or jump to it if it is already open.
+    fn edit_file(&mut self, path: &Path) {
+        if let Some(index) = self.index_of_path(path) {
+            self.switch_to_buffer(index);
+            return;
+        }
+
+        match Document::open(path) {
+            Ok(document) => {
+                self.write_journal();
+                let outgoing = self.stash();
+                self.slots[self.current] = Some(outgoing);
+
+                self.hash_cache = document.buffer_hash();
+                self.document = document;
+                self.cursor = Cursor::default();
+                self.offset_row = 0;
+                self.offset_col = 0;
+                self.undo_stack.clear();
+                self.redo_stack.clear();
+                self.edits_since_journal = 0;
+                self.mode = Mode::Normal;
+
+                self.slots.push(None);
+                self.current = self.slots.len() - 1;
+
+                // A file opened here deserves the same recovery check as one
+                // opened on the command line.
+                self.check_for_recovery();
+                if !self.pending_recovery {
+                    self.announce_buffer();
+                }
+            }
+            Err(error) => self.notify(format!("could not open: {error}"), Level::Error),
+        }
+    }
+
+    fn index_of_path(&self, path: &Path) -> Option<usize> {
+        let wanted = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let same = |candidate: Option<&Path>| {
+            candidate
+                .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()) == wanted)
+                .unwrap_or(false)
+        };
+
+        if same(self.document.path()) {
+            return Some(self.current);
+        }
+        self.slots.iter().enumerate().find_map(|(index, slot)| {
+            slot.as_ref()
+                .filter(|stashed| same(stashed.document.path()))
+                .map(|_| index)
+        })
+    }
+
+    /// `:bd` — close the current buffer.
+    ///
+    /// Refuses to drop unsaved work without `:bd!`, for the same reason `:q`
+    /// does: the whole point of this editor is not losing a change silently.
+    fn close_buffer(&mut self, force: bool) {
+        if !force && self.is_modified() {
+            self.notify(
+                "unsaved changes — :w to write, :bd! to discard this buffer",
+                Level::Warn,
+            );
+            return;
+        }
+        if self.slots.len() == 1 {
+            self.notify("last buffer — :q to leave the editor", Level::Warn);
+            return;
+        }
+
+        self.clear_journal();
+        self.slots.remove(self.current);
+        // Land on the buffer that took its place, or the new last one.
+        let next = self.current.min(self.slots.len() - 1);
+        let Some(target) = self.slots[next].take() else { return };
+        self.restore(target);
+        self.current = next;
+        self.mode = Mode::Normal;
+        self.cursor.clamp(&self.document.buffer, self.mode);
+        self.announce_buffer();
+    }
+
+    fn list_buffers(&mut self) {
+        let names: Vec<String> = self
+            .open_buffers()
+            .into_iter()
+            .map(|(index, name, modified)| {
+                let marker = if index == self.current { '>' } else { ' ' };
+                let dirty = if modified { "+" } else { "" };
+                format!("{marker}{} {name}{dirty}", index + 1)
+            })
+            .collect();
+        self.notify(names.join("   "), Level::Info);
+    }
+
+    // ── File picker ─────────────────────────────────────────────
+
+    /// `:buffers` — pick from what is already open.
+    fn open_buffer_picker(&mut self) {
+        let entries = self
+            .open_buffers()
+            .into_iter()
+            .map(|(index, name, modified)| PickerEntry {
+                label: format!("{}{}", name, if modified { " [+]" } else { "" }),
+                action: PickerAction::Buffer(index),
+            })
+            .collect();
+        self.picker = Some(Picker {
+            entries,
+            query: String::new(),
+            selected: self.current,
+            title: "BUFFERS",
+        });
+    }
+
+    /// `:find` — pick a file from the tree below the working directory.
+    ///
+    /// Walks a bounded number of entries and never descends into the usual
+    /// black holes: a picker that hangs on `.git` or `target` is a picker
+    /// nobody opens twice.
+    fn open_file_picker(&mut self) {
+        const SKIP: [&str; 6] = [".git", "target", "node_modules", ".venv", "dist", "build"];
+        const LIMIT: usize = 4000;
+
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut found: Vec<PathBuf> = Vec::new();
+        let mut queue = vec![root.clone()];
+
+        while let Some(directory) = queue.pop() {
+            if found.len() >= LIMIT {
+                break;
+            }
+            let Ok(entries) = std::fs::read_dir(&directory) else { continue };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || SKIP.contains(&name.as_str()) {
+                    continue;
+                }
+                let path = entry.path();
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => queue.push(path),
+                    Ok(kind) if kind.is_file() => found.push(path),
+                    _ => {}
+                }
+            }
+        }
+
+        found.sort();
+        let entries: Vec<PickerEntry> = found
+            .into_iter()
+            .map(|path| {
+                let label = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                PickerEntry { label, action: PickerAction::Open(path) }
+            })
+            .collect();
+
+        if entries.is_empty() {
+            self.notify("no files found below the working directory", Level::Warn);
+            return;
+        }
+
+        self.picker = Some(Picker {
+            entries,
+            query: String::new(),
+            selected: 0,
+            title: "FIND FILE",
+        });
+    }
+
+    fn handle_picker(&mut self, key: KeyEvent) {
+        let Some(picker) = self.picker.as_mut() else { return };
+
+        match key.code {
+            KeyCode::Esc => self.picker = None,
+            KeyCode::Enter => {
+                let chosen = picker.chosen();
+                self.picker = None;
+                match chosen {
+                    Some(PickerAction::Buffer(index)) => self.switch_to_buffer(index),
+                    Some(PickerAction::Open(path)) => self.edit_file(&path),
+                    None => self.notify("nothing matched", Level::Warn),
+                }
+            }
+            KeyCode::Up => picker.move_by(-1),
+            KeyCode::Down => picker.move_by(1),
+            KeyCode::Backspace => {
+                // Backspacing past an empty query closes the picker, the way
+                // it does in Command and Search mode.
+                if picker.query.pop().is_none() {
+                    self.picker = None;
+                } else {
+                    picker.clamp();
+                }
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                picker.query.push(ch);
+                // Narrowing can strand the highlight past the end of the list.
+                picker.selected = 0;
+                picker.clamp();
+            }
+            _ => {}
         }
     }
 
@@ -652,6 +1064,13 @@ impl App {
             key.code = self.keymap.resolve(key.code);
         }
 
+        // The picker owns the keyboard while it is open, like the help
+        // overlay: a list you are typing into is not a buffer you are editing.
+        if self.picker.is_some() {
+            self.handle_picker(key);
+            return;
+        }
+
         if self.show_help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')) {
                 self.show_help = false;
@@ -663,6 +1082,13 @@ impl App {
         // `:w` always remains the canonical route.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             self.write(false);
+            return;
+        }
+
+        // Ctrl-p for the file picker: the one binding everyone already has in
+        // their fingers from every other editor.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+            self.open_file_picker();
             return;
         }
 
@@ -1537,6 +1963,20 @@ impl App {
                 self.notify(format!("sha256 {hash}"), Level::Info);
             }
             "check" => self.check_disk(),
+            "bn" | "bnext" => {
+                let next = (self.current + 1) % self.slots.len().max(1);
+                self.switch_to_buffer(next);
+            }
+            "bp" | "bprev" => {
+                let count = self.slots.len().max(1);
+                let previous = (self.current + count - 1) % count;
+                self.switch_to_buffer(previous);
+            }
+            "bd" => self.close_buffer(false),
+            "bd!" => self.close_buffer(true),
+            "ls" | "files" => self.list_buffers(),
+            "buffers" => self.open_buffer_picker(),
+            "find" => self.open_file_picker(),
             "recover" => self.recover(),
             "discard" => self.discard_recovery(),
             "info" => self.show_info(),
@@ -1559,7 +1999,10 @@ impl App {
             }
             "" => {}
             other => {
-                if let Some(path) = other.strip_prefix("w ") {
+                if let Some(path) = other.strip_prefix("e ").or_else(|| other.strip_prefix("edit ")) {
+                    let path = path.trim().to_string();
+                    self.edit_file(Path::new(&path));
+                } else if let Some(path) = other.strip_prefix("w ") {
                     let path = path.trim().to_string();
                     match self.document.save_as(Path::new(&path)) {
                         Ok(()) => {
@@ -2059,6 +2502,219 @@ mod tests {
 
         keys(&mut app, "l");
         assert_eq!(app.cursor.col, 1, "one step, not three");
+    }
+
+    // ── Buffers and the picker ──────────────────────────────────
+
+    /// Two real files in a scratch directory, and an editor holding the first.
+    fn app_with_two_files(name: &str) -> (App, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("maat_buffers_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let one = dir.join("one.txt");
+        let two = dir.join("two.txt");
+        std::fs::write(&one, "first file").unwrap();
+        std::fs::write(&two, "second file").unwrap();
+
+        let app = App::new(Document::open(&one).unwrap());
+        (app, one, two)
+    }
+
+    /// The invariant the whole design rests on.
+    fn assert_one_live_slot(app: &App) {
+        let live: Vec<usize> = app
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_none())
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(live, vec![app.current], "exactly one slot is live, and it is the current one");
+    }
+
+    #[test]
+    fn an_editor_starts_with_exactly_one_buffer() {
+        let app = app_with("hello");
+        assert_eq!(app.buffer_count(), 1);
+        assert_eq!(app.buffer_index(), 1);
+        assert_one_live_slot(&app);
+    }
+
+    #[test]
+    fn opening_a_file_adds_a_buffer_and_switches_to_it() {
+        let (mut app, _one, two) = app_with_two_files("open");
+        command(&mut app, &format!("e {}", two.display()));
+
+        assert_eq!(app.buffer_count(), 2);
+        assert_eq!(app.document.buffer.line(0), Some("second file"));
+        assert_one_live_slot(&app);
+    }
+
+    #[test]
+    fn switching_back_restores_the_cursor_and_the_text() {
+        let (mut app, one, two) = app_with_two_files("restore");
+        keys(&mut app, "lll");
+        assert_eq!(app.cursor.col, 3);
+
+        command(&mut app, &format!("e {}", two.display()));
+        assert_eq!(app.cursor.col, 0, "a fresh buffer starts at the top");
+
+        command(&mut app, &format!("e {}", one.display()));
+        assert_eq!(app.document.buffer.line(0), Some("first file"));
+        assert_eq!(app.cursor.col, 3, "the cursor came back with the buffer");
+        assert_one_live_slot(&app);
+    }
+
+    #[test]
+    fn opening_a_file_that_is_already_open_switches_rather_than_duplicating() {
+        let (mut app, one, two) = app_with_two_files("dedupe");
+        command(&mut app, &format!("e {}", two.display()));
+        command(&mut app, &format!("e {}", one.display()));
+        command(&mut app, &format!("e {}", two.display()));
+
+        assert_eq!(app.buffer_count(), 2, "still two, not four");
+        assert_eq!(app.document.buffer.line(0), Some("second file"));
+    }
+
+    #[test]
+    fn each_buffer_keeps_its_own_undo_history() {
+        let (mut app, one, two) = app_with_two_files("history");
+        press(&mut app, KeyCode::Char('x')); // edit the first
+        assert_eq!(app.document.buffer.line(0), Some("irst file"));
+
+        command(&mut app, &format!("e {}", two.display()));
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(
+            app.document.buffer.line(0),
+            Some("second file"),
+            "undo in a fresh buffer must not reach into another one's history"
+        );
+
+        command(&mut app, &format!("e {}", one.display()));
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.document.buffer.line(0), Some("first file"), "its own history survived");
+    }
+
+    #[test]
+    fn bn_and_bp_walk_the_list_and_wrap() {
+        let (mut app, _one, two) = app_with_two_files("walk");
+        command(&mut app, &format!("e {}", two.display()));
+        assert_eq!(app.buffer_index(), 2);
+
+        command(&mut app, "bn");
+        assert_eq!(app.buffer_index(), 1, "wraps past the end");
+        command(&mut app, "bp");
+        assert_eq!(app.buffer_index(), 2, "and back the other way");
+        assert_one_live_slot(&app);
+    }
+
+    #[test]
+    fn closing_a_buffer_refuses_to_drop_unsaved_work() {
+        let (mut app, _one, two) = app_with_two_files("bd");
+        command(&mut app, &format!("e {}", two.display()));
+        press(&mut app, KeyCode::Char('x'));
+
+        command(&mut app, "bd");
+        assert_eq!(app.buffer_count(), 2, "still open");
+        assert!(app.message.contains(":bd!"));
+
+        command(&mut app, "bd!");
+        assert_eq!(app.buffer_count(), 1);
+        assert_eq!(app.document.buffer.line(0), Some("first file"));
+        assert_one_live_slot(&app);
+    }
+
+    #[test]
+    fn the_last_buffer_cannot_be_closed() {
+        let mut app = app_with("only");
+        command(&mut app, "bd");
+        assert_eq!(app.buffer_count(), 1);
+        assert!(app.message.contains(":q"));
+    }
+
+    #[test]
+    fn the_picker_filters_as_you_type_and_opens_what_is_chosen() {
+        let (mut app, _one, two) = app_with_two_files("picker");
+        command(&mut app, &format!("e {}", two.display()));
+        command(&mut app, "buffers");
+
+        let picker = app.picker.as_ref().expect("picker is open");
+        assert_eq!(picker.matches().len(), 2);
+
+        keys(&mut app, "one");
+        let picker = app.picker.as_ref().unwrap();
+        assert_eq!(picker.matches().len(), 1, "narrowed to one.txt");
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_none(), "closes on choosing");
+        assert_eq!(app.document.buffer.line(0), Some("first file"));
+    }
+
+    #[test]
+    fn the_picker_swallows_keys_instead_of_editing_the_buffer() {
+        // Typing a filter must not run `d` and `x` against the text behind it.
+        let (mut app, _one, _two) = app_with_two_files("swallow");
+        command(&mut app, "buffers");
+        keys(&mut app, "dx");
+        assert_eq!(app.document.buffer.line(0), Some("first file"));
+        assert_eq!(app.picker.as_ref().unwrap().query, "dx");
+    }
+
+    #[test]
+    fn esc_closes_the_picker_and_backspace_past_empty_does_too() {
+        let (mut app, _one, _two) = app_with_two_files("close");
+        command(&mut app, "buffers");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.picker.is_none());
+
+        command(&mut app, "buffers");
+        keys(&mut app, "a");
+        press(&mut app, KeyCode::Backspace);
+        assert!(app.picker.is_some(), "removed a character");
+        press(&mut app, KeyCode::Backspace);
+        assert!(app.picker.is_none(), "backspacing past empty closes it");
+    }
+
+    #[test]
+    fn the_highlight_never_points_past_the_filtered_list() {
+        let (mut app, _one, two) = app_with_two_files("clamp");
+        command(&mut app, &format!("e {}", two.display()));
+        command(&mut app, "buffers");
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        keys(&mut app, "one"); // narrows to a single entry
+        let picker = app.picker.as_ref().unwrap();
+        assert!(picker.selected < picker.matches().len().max(1));
+    }
+
+    #[test]
+    fn the_selection_wraps_in_both_directions() {
+        let (mut app, _one, two) = app_with_two_files("wrap");
+        command(&mut app, &format!("e {}", two.display()));
+        command(&mut app, "buffers");
+        // Two entries: selected starts on the current buffer, index 1.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0, "wrapped to the top");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 1, "and back to the bottom");
+    }
+
+    #[test]
+    fn opening_a_path_that_does_not_exist_yet_starts_an_empty_buffer_for_it() {
+        // Same contract as `vim some-file-that-does-not-exist`, and the same
+        // one `Document::open` already had: the buffer is prepared, and it is
+        // the eventual `:w` that either creates the file or fails.
+        let (mut app, _one, two) = app_with_two_files("newfile");
+        let fresh = two.parent().unwrap().join("not-yet.txt");
+
+        command(&mut app, &format!("e {}", fresh.display()));
+        assert_eq!(app.buffer_count(), 2);
+        assert_eq!(app.document.buffer.line(0), Some(""));
+        assert_eq!(app.document.name(), "not-yet.txt");
+        assert!(!fresh.exists(), "opening it must not create it");
+        assert_one_live_slot(&app);
     }
 
     // ── Key map ─────────────────────────────────────────────────

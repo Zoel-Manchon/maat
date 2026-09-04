@@ -51,7 +51,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_status(frame, chunks[1], app);
     draw_message(frame, chunks[2], app);
 
-    if app.show_help {
+    if app.picker.is_some() {
+        draw_picker(frame, app);
+    } else if app.show_help {
         draw_help(frame);
     } else if !app.is_welcome() {
         place_cursor(frame, chunks[0], app, gutter);
@@ -297,7 +299,13 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     };
     let tag = format!(" {} ", app.mode.label());
 
-    let name = app.document.name();
+    // The buffer counter only appears once there is more than one: a status
+    // bar that says [1/1] on every single-file session is noise.
+    let name = if app.buffer_count() > 1 {
+        format!("{} [{}/{}]", app.document.name(), app.buffer_index(), app.buffer_count())
+    } else {
+        app.document.name()
+    };
     let modified = if app.is_modified() { " [+]" } else { "" };
     let hash: String = app.hash().chars().take(10).collect();
     // A count in progress is echoed next to the position, the way Vim shows it
@@ -367,7 +375,7 @@ fn draw_message(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// The key guide, as section/keys pairs. An empty section opens a free line.
-const HELP_ROWS: [(&str, &str); 16] = [
+const HELP_ROWS: [(&str, &str); 18] = [
     ("MOVEMENT", "h j k l · w b · 0 $ · gg G · 12G"),
     ("COUNTS", "3j · 5x · 2dd · 3p — before any of the above"),
     ("INSERT", "i a I A · o O · Esc"),
@@ -378,6 +386,8 @@ const HELP_ROWS: [(&str, &str); 16] = [
     ("SEARCH", "/text · n next · N previous"),
     ("REPLACE", ":s/old/new/ · :s/old/new/g · :%s/old/new/g"),
     ("FILES", ":w · :w <path> · :w! · :q · :q! · :wq"),
+    ("BUFFERS", ":e <path> · :bn · :bp · :bd · :ls"),
+    ("PICKER", "Ctrl-p find file · :buffers · type to filter"),
     ("INTEGRITY", ":hash · :check · :info"),
     ("RECOVERY", ":recover · :discard"),
     ("DISPLAY", ":set relativenumber · :set number"),
@@ -389,6 +399,67 @@ const HELP_ROWS: [(&str, &str); 16] = [
 const HELP_TITLE: &str = " MAAT · QUICK REFERENCE ";
 /// Blank columns left of the key column, right of the box, and between columns.
 const HELP_PADDING: usize = 2;
+
+/// The picker overlay: a filter line and the matching entries.
+///
+/// Sized to the screen rather than to its contents — a file list is unbounded,
+/// and a box that grows with it would run off the terminal on the first large
+/// repository.
+fn draw_picker(frame: &mut Frame, app: &App) {
+    let Some(picker) = app.picker.as_ref() else { return };
+
+    let area = frame.area();
+    let box_width = (area.width as usize).saturating_sub(8).clamp(20, 76);
+    let matches = picker.matches();
+    // Leave room for the border, the query line and the count.
+    let rows = (area.height as usize).saturating_sub(8).clamp(1, 14);
+    let visible = matches.len().min(rows);
+
+    // Scroll the window so the highlighted row is always inside it.
+    let first = picker.selected.saturating_sub(visible.saturating_sub(1));
+
+    let mut lines: Vec<Line> = Vec::with_capacity(visible + 2);
+    lines.push(Line::from(vec![
+        Span::styled("  ", theme::overlay_dim()),
+        Span::styled("> ", theme::welcome_accent()),
+        Span::styled(picker.query.clone(), theme::overlay_dim()),
+        Span::styled("_", theme::welcome_accent()),
+    ]));
+    lines.push(Line::from(Span::styled("", theme::overlay_dim())));
+
+    for (offset, (_, entry)) in matches.iter().skip(first).take(visible).enumerate() {
+        let index = first + offset;
+        let selected = index == picker.selected;
+        let marker = if selected { "  ▸ " } else { "    " };
+        let style = if selected { theme::selection() } else { theme::overlay_dim() };
+        let label = truncate(&entry.label, box_width.saturating_sub(6));
+        lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
+    }
+
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled("    no match", theme::tilde())));
+    }
+
+    let box_height = lines.len() + 2;
+    let x = area.x + (area.width.saturating_sub(box_width as u16)) / 2;
+    let y = area.y + (area.height.saturating_sub(box_height as u16)) / 3;
+    let rect = Rect {
+        x,
+        y,
+        width: (box_width as u16).min(area.width),
+        height: (box_height as u16).min(area.height),
+    };
+
+    let title = format!(" {} · {} of {} ", picker.title, matches.len(), picker.entry_count());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::overlay_border())
+        .style(theme::overlay())
+        .title(Line::from(Span::styled(title, theme::overlay_title())));
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
+}
 
 fn draw_help(frame: &mut Frame) {
     let width = |text: &str| text.chars().count();

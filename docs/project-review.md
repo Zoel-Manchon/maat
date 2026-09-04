@@ -148,9 +148,18 @@ whole document after every keystroke.
       `toml` + `serde`: a dozen scalars are not worth quadrupling a three-crate
       dependency tree in a binary that has to stay small and auditable. Keys it
       does not recognise are reported on the message line, not swallowed.
-- File picker and multiple buffers. **Still open.** `App` owns exactly one
-  `Document` today; multiple buffers means a buffer list, per-buffer cursors
-  and history, and a UI for switching — the largest single piece left.
+- [x] File picker and multiple buffers. `:e` opens, `:bn` / `:bp` / `:bd` /
+      `:ls` manage, and two pickers — `Ctrl-p` over the file tree, `:buffers`
+      over what is open — filter by substring as you type.
+
+      The live buffer's state stays in `App`'s own fields and switching swaps
+      the whole set in and out, rather than routing every `self.cursor` through
+      an index. That keeps a thousand lines untouched to change nothing
+      observable, and leaves an invariant small enough to assert in one line:
+      exactly one slot is `None`, and it is the current one. Cursor, scroll and
+      undo history are per buffer; the register, search and keymap are shared,
+      which is what a person expects from yanking in one file and pasting in
+      another.
 
 ### 0.5
 

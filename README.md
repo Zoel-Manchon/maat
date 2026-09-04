@@ -18,7 +18,7 @@
 | **The one idea** | Opening a file records its SHA-256. Before writing, maat hashes the file again. If it no longer matches, it warns instead of silently overwriting whatever the other party wrote. |
 | **Built with** | Rust · `ratatui` · `crossterm` · `sha2` — four crates, on purpose |
 | **Size** | ~6 300 lines · **188 tests** · a 906 KB static musl binary |
-| **Editing** | Modal (Normal / Insert / Command / Search / Visual) · counts · operators composed with motions · literal `:s` substitution · undo & redo |
+| **Editing** | Modal (Normal / Insert / Command / Search / Visual) · counts · operators composed with motions · literal `:s` substitution · undo & redo · multiple buffers with a file picker |
 | **Integrity** | Atomic saves · external-change detection · crash-recovery journal · audit events in JSON or CEF · `--verify` for scripts |
 | **Made for** | Appliance consoles, shared servers and config files — anywhere a blind overwrite destroys someone else's change, or an attacker's tracks |
 | **Run it** | `cargo run -- notes.txt` |
@@ -222,6 +222,7 @@ The destination directory must already exist.
 | `v` / `V` | Visual mode, character-wise / line-wise |
 | `3j` `5x` `2dd` | A count applies to any motion or operator |
 | `12G` | Jump to line 12 |
+| `Ctrl-p` | Open the file picker |
 
 ### Visual mode
 
@@ -245,6 +246,12 @@ The destination directory must already exist.
 | `:w!` | Force save after an integrity warning |
 | `:q` / `:q!` | Quit / discard changes |
 | `:wq` / `:x` | Save and quit |
+| `:e <path>` | Open a file in a new buffer, or jump to it if already open |
+| `:bn` / `:bp` | Next / previous buffer, wrapping |
+| `:bd` / `:bd!` | Close this buffer / discard its unsaved changes |
+| `:ls` | List open buffers on the message line |
+| `:buffers` | Pick from the open buffers |
+| `:find` | Pick a file from below the working directory |
 | `:s/old/new/` | Replace the first match on the current line |
 | `:s/old/new/g` | Replace every match on the current line |
 | `:%s/old/new/g` | Replace every match in the file |
@@ -275,6 +282,8 @@ The destination directory must already exist.
 - CRLF and LF line endings preserved exactly as the file had them.
 - Bracketed paste: a pasted block is inserted as text, never run as commands.
 - System clipboard over **OSC 52** — works through SSH, needs no display server.
+- **Multiple buffers** with per-buffer cursor, scroll and undo history.
+- **File picker** (`Ctrl-p`) and buffer picker, filtered by substring as you type.
 - External-change detection before save; explicit `:w!` override.
 - Live SHA-256 fingerprint and `:check` integrity command.
 - Integrated `?` help panel and a branded welcome screen.
@@ -550,7 +559,7 @@ and `ffmpeg` on the PATH.
 - [x] Configurable **key map** — a `[keys]` table rebinds any key to any other,
       applied before dispatch so counts, operators and visual mode keep working.
 - [ ] Syntax highlighting with language detection.
-- [ ] Tabs, multiple buffers and a file picker.
+- [x] Multiple buffers and a file picker (`:e`, `:bn`, `:bd`, `Ctrl-p`).
 - [ ] Rope or piece-table storage for large files.
 
 See [`docs/project-review.md`](docs/project-review.md) for the technical review
