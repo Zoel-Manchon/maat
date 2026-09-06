@@ -2,6 +2,14 @@
 
 # MAAT
 
+[![CI](https://github.com/Zoel-Manchon/maat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Zoel-Manchon/maat/actions/workflows/ci.yml)
+![Rust](https://img.shields.io/badge/Rust-CE422B?style=flat-square&logo=rust&logoColor=white)
+![ratatui](https://img.shields.io/badge/ratatui-6E7681?style=flat-square)
+![crossterm](https://img.shields.io/badge/crossterm-6E7681?style=flat-square)
+![SHA-256 on open](https://img.shields.io/badge/SHA--256-on_open-E8B339?style=flat-square)
+![audit JSON / CEF](https://img.shields.io/badge/audit-JSON_/_CEF-1F2A37?style=flat-square)
+![license MIT](https://img.shields.io/badge/license-MIT-2A3340?style=flat-square)
+
 **A retro modal terminal editor with integrity awareness.**
 
 *As above, so below — the buffer and the disk must agree.*
